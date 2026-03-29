@@ -25,6 +25,7 @@
     "typecheck": "tsc --noEmit",
     "smoke:app-server-permissions": "node ./scripts/app-server-permissions-smoke.mjs",
     "smoke:app-server-thread-permissions": "node ./scripts/app-server-thread-permissions-smoke.mjs",
+    "deploy:local": "bash ./scripts/deploy-local-extension.sh",
     "pack:smoke": "node ./scripts/pack-smoke.mjs",
     "release:metadata": "node ./scripts/release-metadata.mjs",
     "release:apply-version": "node ./scripts/apply-release-version.mjs"

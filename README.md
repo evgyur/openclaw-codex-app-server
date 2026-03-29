@@ -249,6 +249,24 @@ Remove the linked local checkout:
 pnpm openclaw plugins uninstall openclaw-codex-app-server
 ```
 
+### Cockpit source-of-truth / deploy contract
+
+For the Chip cockpit setup, treat this repository as the **only source of truth**.
+
+- Canonical source: your git checkout of `openclaw-codex-app-server`
+- Runtime artifact: `~/.openclaw/extensions/openclaw-codex-app-server`
+- Rule: do **not** edit files in `~/.openclaw/extensions/openclaw-codex-app-server` as the permanent fix path
+
+Preferred local workflow:
+
+1. edit + test in this repo
+2. deploy via `openclaw plugins install --link "/absolute/path/to/openclaw-codex-app-server"`
+   - or, for the current Chip cockpit runtime layout, run `pnpm deploy:local` to sync this repo into `~/.openclaw/extensions/openclaw-codex-app-server`
+3. restart the gateway
+4. verify in the cockpit chat/topic
+
+If you had to hotfix the runtime copy during an incident, back-port the change into this repo immediately before the next deploy/reinstall.
+
 ### 3. Start the local gateway
 
 From the OpenClaw checkout:

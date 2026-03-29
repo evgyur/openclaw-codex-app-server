@@ -1247,6 +1247,7 @@ export class CodexPluginController {
   private readonly client;
   private readonly activeRuns = new Map<string, ActiveRunRecord>();
   private readonly threadChangesCache = new Map<string, Promise<boolean | undefined>>();
+  private readonly processedAudioHookMessages = new Map<string, number>();
   private readonly store;
   private serviceWorkspaceDir?: string;
   private lastRuntimeConfig?: unknown;
@@ -1461,6 +1462,137 @@ export class CodexPluginController {
       const detail =
         error instanceof Error ? `${error.message}\n${error.stack ?? ""}`.trim() : String(error);
       this.api.logger.error(`codex inbound claim failed: ${detail}`);
+      throw error;
+    }
+  }
+
+  async handleMessageTranscribed(event: {
+    type?: string;
+    action?: string;
+    sessionKey?: string;
+    context?: Record<string, unknown>;
+  }): Promise<void> {
+    await this.handleAudioHookTranscript(event, "transcribed");
+  }
+
+  async handleMessagePreprocessed(event: {
+    type?: string;
+    action?: string;
+    sessionKey?: string;
+    context?: Record<string, unknown>;
+  }): Promise<void> {
+    await this.handleAudioHookTranscript(event, "preprocessed");
+  }
+
+  private buildConversationTargetFromHookContext(
+    context: Record<string, unknown>,
+  ): ConversationTarget | null {
+    const channelId = typeof context.channelId === "string" ? context.channelId.trim().toLowerCase() : "";
+    const accountId = typeof context.accountId === "string" && context.accountId.trim()
+      ? context.accountId.trim()
+      : "default";
+    const rawConversationId =
+      typeof context.conversationId === "string" ? context.conversationId.trim() : "";
+    if (!channelId || !rawConversationId) {
+      return null;
+    }
+    if (channelId === "telegram") {
+      const normalized = normalizeTelegramChatId(rawConversationId);
+      if (!normalized) {
+        return null;
+      }
+      const topicMatch = /^(.*):topic:(\d+)$/.exec(normalized);
+      return {
+        channel: "telegram",
+        accountId,
+        conversationId: normalized,
+        parentConversationId: topicMatch?.[1],
+        threadId: topicMatch?.[2] ? Number(topicMatch[2]) : undefined,
+      };
+    }
+    if (channelId === "discord") {
+      const guildId = typeof context.groupId === "string" ? context.groupId.trim() : "";
+      return toConversationTargetFromInbound({
+        channel: "discord",
+        accountId,
+        conversationId: rawConversationId,
+        isGroup: Boolean(context.isGroup) || Boolean(guildId),
+        metadata: guildId ? { guildId } : undefined,
+      });
+    }
+    return null;
+  }
+
+  private pruneProcessedAudioHookMessages(now = Date.now()): void {
+    for (const [key, seenAt] of this.processedAudioHookMessages) {
+      if (now - seenAt > 10 * 60_000) {
+        this.processedAudioHookMessages.delete(key);
+      }
+    }
+  }
+
+  private async handleAudioHookTranscript(
+    event: {
+      type?: string;
+      action?: string;
+      sessionKey?: string;
+      context?: Record<string, unknown>;
+    },
+    source: "transcribed" | "preprocessed",
+  ): Promise<void> {
+    if (!this.settings.enabled) {
+      return;
+    }
+    await this.start();
+    const context = asRecord(event.context);
+    if (!context) {
+      return;
+    }
+    const transcript = typeof context.transcript === "string" ? context.transcript.trim() : "";
+    if (!transcript) {
+      return;
+    }
+    const conversation = this.buildConversationTargetFromHookContext(context);
+    if (!conversation) {
+      return;
+    }
+    const existingBinding = this.store.getBinding(conversation);
+    const hydratedBinding = existingBinding ? null : await this.hydrateApprovedBinding(conversation);
+    const resolvedBinding = existingBinding ?? hydratedBinding?.binding ?? null;
+    if (!resolvedBinding) {
+      return;
+    }
+    const messageId = typeof context.messageId === "string" ? context.messageId.trim() : "";
+    const dedupeKey = [source === "preprocessed" ? "audio-fallback" : "audio", conversation.channel, conversation.accountId ?? "default", conversation.conversationId, messageId || transcript].join("::");
+    this.pruneProcessedAudioHookMessages();
+    if (this.processedAudioHookMessages.has(dedupeKey)) {
+      return;
+    }
+    const primaryKey = ["audio", conversation.channel, conversation.accountId ?? "default", conversation.conversationId, messageId || transcript].join("::");
+    const fallbackKey = ["audio-fallback", conversation.channel, conversation.accountId ?? "default", conversation.conversationId, messageId || transcript].join("::");
+    if (source === "preprocessed") {
+      if (this.processedAudioHookMessages.has(primaryKey)) {
+        return;
+      }
+    } else if (this.processedAudioHookMessages.has(fallbackKey)) {
+      return;
+    }
+    this.processedAudioHookMessages.set(dedupeKey, Date.now());
+    this.api.logger.debug?.(
+      `codex audio transcript handoff source=${source} ${this.formatConversationForLog(conversation)} chars=${transcript.length}`,
+    );
+    try {
+      await this.handleInboundClaim({
+        content: transcript,
+        channel: conversation.channel,
+        accountId: conversation.accountId,
+        conversationId: conversation.conversationId,
+        parentConversationId: conversation.parentConversationId,
+        threadId: conversation.threadId,
+        isGroup: Boolean(context.isGroup) || Boolean(conversation.parentConversationId),
+      });
+    } catch (error) {
+      this.processedAudioHookMessages.delete(dedupeKey);
       throw error;
     }
   }

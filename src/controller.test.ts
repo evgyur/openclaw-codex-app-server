@@ -4163,6 +4163,101 @@ describe("Discord controller flows", () => {
     expect(startTurn).toHaveBeenCalled();
   });
 
+  it("forwards transcribed audio into the bound Codex topic as normal text", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "-1003701370893:topic:9",
+        parentConversationId: "-1003701370893",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+    const startTurn = vi.fn(() => ({
+      result: Promise.resolve({
+        threadId: "thread-1",
+        text: "ok",
+      }),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => true),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    }));
+    (controller as any).client.startTurn = startTurn;
+
+    await (controller as any).handleMessageTranscribed({
+      context: {
+        channelId: "telegram",
+        accountId: "default",
+        conversationId: "-1003701370893:topic:9",
+        messageId: "voice-1",
+        transcript: "сделай это как обычный текст",
+      },
+    });
+
+    expect(startTurn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        prompt: "сделай это как обычный текст",
+      }),
+    );
+  });
+
+  it("does not double-forward preprocessed audio when the transcript hook already handled it", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "-1003701370893:topic:9",
+        parentConversationId: "-1003701370893",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+    const startTurn = vi.fn(() => ({
+      result: Promise.resolve({
+        threadId: "thread-1",
+        text: "ok",
+      }),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => true),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    }));
+    (controller as any).client.startTurn = startTurn;
+
+    await (controller as any).handleMessageTranscribed({
+      context: {
+        channelId: "telegram",
+        accountId: "default",
+        conversationId: "-1003701370893:topic:9",
+        messageId: "voice-2",
+        transcript: "проверь дубликаты",
+      },
+    });
+    await (controller as any).handleMessagePreprocessed({
+      context: {
+        channelId: "telegram",
+        accountId: "default",
+        conversationId: "-1003701370893:topic:9",
+        messageId: "voice-2",
+        transcript: "проверь дубликаты",
+      },
+    });
+
+    expect(startTurn).toHaveBeenCalledTimes(1);
+  });
+
   it("passes trusted local media roots when sending a Telegram plan attachment", async () => {
     const { controller, sendMessageTelegram, stateDir } = await createControllerHarness();
     const attachmentPath = path.join(stateDir, "tmp", "plan.md");
