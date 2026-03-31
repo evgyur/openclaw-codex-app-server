@@ -23,6 +23,12 @@ import {
   type DiscordComponentMessageSpec,
   resolveDiscordAccount,
 } from "openclaw/plugin-sdk/discord";
+import {
+  renameForumTopicTelegram,
+  resolveTelegramToken,
+  sendMessageTelegram,
+  sendTypingTelegram,
+} from "openclaw/plugin-sdk/telegram";
 import { resolvePluginSettings, resolveWorkspaceDir } from "./config.js";
 import { CodexAppServerModeClient, type ActiveCodexRun, isMissingThreadError } from "./client.js";
 import { getThreadDisplayTitle } from "./thread-display.js";
@@ -6341,6 +6347,24 @@ export class CodexPluginController {
       `codex outbound send start ${this.formatConversationForLog(conversation)} textChars=${text.length} media=${hasMedia ? "yes" : "no"} buttons=${payload.buttons?.length ?? 0} preview="${summarizeTextForLog(text, 80)}"`,
     );
     if (isTelegramChannel(conversation.channel)) {
+      const telegramRuntime = (this.api.runtime.channel as {
+        telegram?: {
+          sendMessageTelegram?: typeof sendMessageTelegram;
+        };
+      }).telegram;
+      const sendTelegram = async (
+        to: string,
+        messageText: string,
+        opts: Parameters<typeof sendMessageTelegram>[2],
+      ) => {
+        if (telegramRuntime?.sendMessageTelegram) {
+          return await telegramRuntime.sendMessageTelegram(to, messageText, opts);
+        }
+        return await sendMessageTelegram(to, messageText, {
+          ...opts,
+          cfg: this.lastRuntimeConfig as NonNullable<Parameters<typeof sendMessageTelegram>[2]>["cfg"],
+        });
+      };
       const mediaLocalRoots = this.resolveReplyMediaLocalRoots(payload.mediaUrl);
       const limit = this.api.runtime.channel.text.resolveTextChunkLimit(
         undefined,
@@ -6353,7 +6377,7 @@ export class CodexPluginController {
         : [];
       let delivered: DeliveredMessageRef | null = null;
       if (hasMedia) {
-        const result = await this.api.runtime.channel.telegram.sendMessageTelegram(
+        const result = await sendTelegram(
           conversation.parentConversationId ?? conversation.conversationId,
           chunks[0] ?? text,
           {
@@ -6374,7 +6398,7 @@ export class CodexPluginController {
           if (!chunk) {
             continue;
           }
-          const result = await this.api.runtime.channel.telegram.sendMessageTelegram(
+          const result = await sendTelegram(
             conversation.parentConversationId ?? conversation.conversationId,
             chunk,
             {
@@ -6402,7 +6426,7 @@ export class CodexPluginController {
         if (!chunk) {
           continue;
         }
-        const result = await this.api.runtime.channel.telegram.sendMessageTelegram(
+        const result = await sendTelegram(
           conversation.parentConversationId ?? conversation.conversationId,
           chunk,
           {
@@ -6603,11 +6627,51 @@ export class CodexPluginController {
     stop: () => void;
   } | null> {
     if (isTelegramChannel(conversation.channel)) {
-      return await this.api.runtime.channel.telegram.typing.start({
-        to: conversation.parentConversationId ?? conversation.conversationId,
-        accountId: conversation.accountId,
-        messageThreadId: conversation.threadId,
-      });
+      const telegramRuntime = (this.api.runtime.channel as {
+        telegram?: {
+          typing?: {
+            start?: (params: {
+              to: string;
+              accountId?: string;
+              messageThreadId?: number;
+            }) => Promise<{
+              stop: () => void;
+            }>;
+          };
+        };
+      }).telegram;
+      if (telegramRuntime?.typing?.start) {
+        return await telegramRuntime.typing.start({
+          to: conversation.parentConversationId ?? conversation.conversationId,
+          accountId: conversation.accountId,
+          messageThreadId: conversation.threadId,
+        });
+      }
+      const to = conversation.parentConversationId ?? conversation.conversationId;
+      const messageThreadId = conversation.threadId;
+      const pulse = async (): Promise<void> => {
+        try {
+          await sendTypingTelegram(to, {
+            cfg: this.lastRuntimeConfig as NonNullable<Parameters<typeof sendTypingTelegram>[1]>["cfg"],
+            accountId: conversation.accountId,
+            messageThreadId,
+          });
+        } catch (error) {
+          this.api.logger.debug?.(
+            `codex telegram typing fallback skipped ${this.formatConversationForLog(conversation)}: ${String(error)}`,
+          );
+        }
+      };
+      await pulse();
+      const timer = setInterval(() => {
+        void pulse();
+      }, 4000);
+      timer.unref?.();
+      return {
+        stop: () => {
+          clearInterval(timer);
+        },
+      };
     }
     if (isDiscordChannel(conversation.channel)) {
       if (conversation.conversationId.startsWith("user:")) {
@@ -6643,33 +6707,34 @@ export class CodexPluginController {
       return null;
     }
     if (isTelegramChannel(conversation.channel)) {
-      const limit = this.api.runtime.channel.text.resolveTextChunkLimit(
-        undefined,
-        "telegram",
-        conversation.accountId,
-        { fallbackLimit: 4000 },
-      );
-      const chunks = this.api.runtime.channel.text.chunkText(trimmed, limit).filter(Boolean);
-      const textChunks = chunks.length > 0 ? chunks : [trimmed];
-      let firstDelivered: DeliveredMessageRef | null = null;
-      for (const chunk of textChunks) {
-        const result = await this.api.runtime.channel.telegram.sendMessageTelegram(
-          conversation.parentConversationId ?? conversation.conversationId,
-          chunk,
-          {
-            accountId: conversation.accountId,
-            messageThreadId: conversation.threadId,
-          },
-        );
-        if (!firstDelivered) {
-          firstDelivered = {
-            provider: "telegram",
-            messageId: result.messageId,
-            chatId: result.chatId,
-          };
-        }
-      }
-      return firstDelivered;
+      const telegramRuntime = (this.api.runtime.channel as {
+        telegram?: {
+          sendMessageTelegram?: typeof sendMessageTelegram;
+        };
+      }).telegram;
+      const result = telegramRuntime?.sendMessageTelegram
+        ? await telegramRuntime.sendMessageTelegram(
+            conversation.parentConversationId ?? conversation.conversationId,
+            trimmed,
+            {
+              accountId: conversation.accountId,
+              messageThreadId: conversation.threadId,
+            },
+          )
+        : await sendMessageTelegram(
+            conversation.parentConversationId ?? conversation.conversationId,
+            trimmed,
+            {
+              cfg: this.lastRuntimeConfig as NonNullable<Parameters<typeof sendMessageTelegram>[2]>["cfg"],
+              accountId: conversation.accountId,
+              messageThreadId: conversation.threadId,
+            },
+          );
+      return {
+        provider: "telegram",
+        messageId: result.messageId,
+        chatId: result.chatId,
+      };
     }
     if (isDiscordChannel(conversation.channel)) {
       const limit = this.api.runtime.channel.text.resolveTextChunkLimit(
@@ -6785,10 +6850,20 @@ export class CodexPluginController {
   }
 
   private async resolveTelegramBotToken(accountId?: string): Promise<string | undefined> {
-    const resolution = this.api.runtime.channel.telegram.resolveTelegramToken?.(
-      this.lastRuntimeConfig,
-      { accountId },
-    );
+    const telegramRuntime = (this.api.runtime.channel as {
+      telegram?: {
+        resolveTelegramToken?: typeof resolveTelegramToken;
+      };
+    }).telegram;
+    const resolution = telegramRuntime?.resolveTelegramToken
+      ? telegramRuntime.resolveTelegramToken(
+          this.lastRuntimeConfig as Parameters<typeof resolveTelegramToken>[0],
+          { accountId },
+        )
+      : resolveTelegramToken(
+          this.lastRuntimeConfig as Parameters<typeof resolveTelegramToken>[0],
+          { accountId },
+        );
     const token = resolution?.token?.trim();
     return token || undefined;
   }
@@ -6870,14 +6945,31 @@ export class CodexPluginController {
     name: string,
   ): Promise<void> {
     if (isTelegramChannel(conversation.channel) && conversation.threadId != null) {
-      await this.api.runtime.channel.telegram.conversationActions.renameTopic(
-        conversation.parentConversationId ?? conversation.conversationId,
-        conversation.threadId,
-        name,
-        {
-          accountId: conversation.accountId,
-        },
-      ).catch((error) => {
+      const telegramRuntime = (this.api.runtime.channel as {
+        telegram?: {
+          conversationActions?: {
+            renameTopic?: typeof renameForumTopicTelegram;
+          };
+        };
+      }).telegram;
+      await (telegramRuntime?.conversationActions?.renameTopic
+        ? telegramRuntime.conversationActions.renameTopic(
+            conversation.parentConversationId ?? conversation.conversationId,
+            conversation.threadId,
+            name,
+            {
+              accountId: conversation.accountId,
+            },
+          )
+        : renameForumTopicTelegram(
+            conversation.parentConversationId ?? conversation.conversationId,
+            conversation.threadId,
+            name,
+            {
+              cfg: this.lastRuntimeConfig as NonNullable<Parameters<typeof renameForumTopicTelegram>[3]>["cfg"],
+              accountId: conversation.accountId,
+            },
+          )).catch((error) => {
         this.api.logger.warn(`codex telegram topic rename failed: ${String(error)}`);
       });
       return;
