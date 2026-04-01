@@ -4101,7 +4101,7 @@ describe("Discord controller flows", () => {
     });
   });
 
-  it("restarts a lingering active plan run instead of queueing a normal inbound message into it", async () => {
+  it("queues a normal inbound message into an active plan run as steer by default", async () => {
     const { controller } = await createControllerHarness();
     await (controller as any).store.upsertBinding({
       conversation: {
@@ -4158,9 +4158,75 @@ describe("Discord controller flows", () => {
     });
 
     expect(result).toEqual({ handled: true });
+    expect(staleQueueMessage).toHaveBeenCalledWith("And? Build it?", [
+      { type: "text", text: "And? Build it?" },
+    ]);
+    expect(staleInterrupt).not.toHaveBeenCalled();
+    expect(startTurn).not.toHaveBeenCalled();
+  });
+
+  it("treats a plain-text stop message as cas_stop for an active run", async () => {
+    const { controller, sendMessageTelegram } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: TEST_TELEGRAM_PEER_ID,
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+    const staleQueueMessage = vi.fn(async () => true);
+    const staleInterrupt = vi.fn(async () => {});
+    (controller as any).activeRuns.set(`telegram::default::${TEST_TELEGRAM_PEER_ID}::`, {
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: TEST_TELEGRAM_PEER_ID,
+      },
+      workspaceDir: "/repo/openclaw",
+      mode: "default",
+      handle: {
+        result: Promise.resolve({ threadId: "thread-1", text: "stale" }),
+        queueMessage: staleQueueMessage,
+        getThreadId: () => "thread-1",
+        interrupt: staleInterrupt,
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      },
+    });
+    const startTurn = vi.fn(() => ({
+      result: Promise.resolve({ threadId: "thread-1", text: "fresh" }),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => true),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    }));
+    (controller as any).client.startTurn = startTurn;
+
+    const result = await controller.handleInboundClaim({
+      content: "stop",
+      channel: "telegram",
+      accountId: "default",
+      conversationId: TEST_TELEGRAM_PEER_ID,
+      isGroup: false,
+      metadata: {},
+    });
+
+    expect(result).toEqual({ handled: true });
     expect(staleQueueMessage).not.toHaveBeenCalled();
     expect(staleInterrupt).toHaveBeenCalled();
-    expect(startTurn).toHaveBeenCalled();
+    expect(startTurn).not.toHaveBeenCalled();
+    expect(sendMessageTelegram).toHaveBeenCalledWith(
+      TEST_TELEGRAM_PEER_ID,
+      "Stopping Codex now.",
+      expect.objectContaining({ accountId: "default" }),
+    );
   });
 
   it("forwards transcribed audio into the bound Codex topic as normal text", async () => {
@@ -4445,7 +4511,7 @@ describe("Discord controller flows", () => {
     );
   });
 
-  it("restarts instead of queueing when structured text input is provided to an active run", async () => {
+  it("queues structured text input onto an active run via steer", async () => {
     const { controller } = await createControllerHarness();
     const staleInterrupt = vi.fn(async () => {});
     const staleQueueMessage = vi.fn(async () => true);
@@ -4507,9 +4573,77 @@ describe("Discord controller flows", () => {
       reason: "inbound",
     });
 
-    expect(staleQueueMessage).not.toHaveBeenCalled();
-    expect(staleInterrupt).toHaveBeenCalled();
-    expect(startTurn).toHaveBeenCalled();
+    expect(staleQueueMessage).toHaveBeenCalledWith("Read this file", [
+      { type: "text", text: "Read this file" },
+      { type: "text", text: "Attached file: note.txt\n\nhello" },
+    ]);
+    expect(staleInterrupt).not.toHaveBeenCalled();
+    expect(startTurn).not.toHaveBeenCalled();
+  });
+
+  it("queues image metadata onto an active run via steer instead of stopping it", async () => {
+    const { controller, stateDir } = await createControllerHarness();
+    const imagePath = path.join(stateDir, "tmp", "active-image.png");
+    fs.mkdirSync(path.dirname(imagePath), { recursive: true });
+    fs.writeFileSync(imagePath, "png");
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: TEST_TELEGRAM_PEER_ID,
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+    const staleQueueMessage = vi.fn(async () => true);
+    const staleInterrupt = vi.fn(async () => {});
+    (controller as any).activeRuns.set(`telegram::default::${TEST_TELEGRAM_PEER_ID}::`, {
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: TEST_TELEGRAM_PEER_ID,
+      },
+      workspaceDir: "/repo/openclaw",
+      mode: "default",
+      handle: {
+        result: Promise.resolve({ threadId: "thread-1", text: "stale" }),
+        queueMessage: staleQueueMessage,
+        getThreadId: () => "thread-1",
+        interrupt: staleInterrupt,
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      },
+    });
+    const startTurn = vi.fn(() => ({
+      result: Promise.resolve({ threadId: "thread-1", text: "fresh" }),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => true),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    }));
+    (controller as any).client.startTurn = startTurn;
+
+    const result = await controller.handleInboundClaim({
+      content: "давай 100 по умолчанию поставим",
+      channel: "telegram",
+      accountId: "default",
+      conversationId: TEST_TELEGRAM_PEER_ID,
+      isGroup: false,
+      metadata: { mediaPath: imagePath, mediaType: "image/png" },
+    });
+
+    expect(result).toEqual({ handled: true });
+    expect(staleQueueMessage).toHaveBeenCalledWith("давай 100 по умолчанию поставим", [
+      { type: "text", text: "давай 100 по умолчанию поставим" },
+      { type: "localImage", path: imagePath },
+    ]);
+    expect(staleInterrupt).not.toHaveBeenCalled();
+    expect(startTurn).not.toHaveBeenCalled();
   });
 
   it("does not send the plan keepalive after a questionnaire is already visible", async () => {
@@ -4919,50 +5053,36 @@ describe("Discord controller flows", () => {
     );
   });
 
-  it("keeps empty completed turns generic instead of inferring an auth failure", async () => {
-    const { controller, clientMock, sendMessageTelegram } = await createControllerHarness();
-    (controller as any).client.startTurn = vi.fn(() => ({
-      result: Promise.resolve({
-        threadId: "thread-1",
-        text: "",
-        terminalStatus: "completed",
-      }),
-      getThreadId: () => "thread-1",
-      queueMessage: vi.fn(async () => false),
-      interrupt: vi.fn(async () => {}),
-      isAwaitingInput: () => false,
-      submitPendingInput: vi.fn(async () => false),
-      submitPendingInputPayload: vi.fn(async () => false),
+  it("recovers the last assistant thread reply before falling back to an empty completion message", async () => {
+    const { controller, clientMock } = await createControllerHarness();
+    (clientMock.readThreadContext as any).mockImplementation(async () => ({
+      lastUserMessage: "who are you?",
+      lastAssistantMessage: "Recovered final answer from thread state.",
     }));
 
-    await (controller as any).startTurn({
-      conversation: {
-        channel: "telegram",
-        accountId: "default",
-        conversationId: TEST_TELEGRAM_PEER_ID,
-      },
-      binding: {
-        conversation: {
-          channel: "telegram",
-          accountId: "default",
-          conversationId: TEST_TELEGRAM_PEER_ID,
-        },
+    await expect(
+      (controller as any).describeEmptyTurnCompletion({
         sessionKey: "session-1",
+        profile: "default",
         threadId: "thread-1",
-        workspaceDir: "/repo/openclaw",
-        updatedAt: Date.now(),
-      },
-      workspaceDir: "/repo/openclaw",
-      prompt: "who are you?",
-      reason: "inbound",
-    });
+      }),
+    ).resolves.toBe("Recovered final answer from thread state.");
+  });
 
-    await flushAsyncWork();
-    expect(sendMessageTelegram).toHaveBeenCalledWith(
-      TEST_TELEGRAM_PEER_ID,
-      "Codex completed without a text reply.",
-      expect.anything(),
-    );
+  it("keeps empty completed turns generic instead of inferring an auth failure", async () => {
+    const { controller, clientMock } = await createControllerHarness();
+    (clientMock.readThreadContext as any).mockImplementation(async () => ({
+      lastUserMessage: undefined,
+      lastAssistantMessage: undefined,
+    }));
+
+    await expect(
+      (controller as any).describeEmptyTurnCompletion({
+        sessionKey: "session-1",
+        profile: "default",
+        threadId: "thread-1",
+      }),
+    ).resolves.toBe("Codex completed without a text reply.");
     expect(clientMock.readAccount).not.toHaveBeenCalled();
   });
 

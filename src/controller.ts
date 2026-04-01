@@ -161,6 +161,9 @@ type TelegramOutboundAdapter = {
   }) => Promise<{ messageId: string; chatId?: string }>;
 };
 const MAX_TEXT_ATTACHMENT_CHARS = 16_000;
+const INBOUND_MEDIA_FALLBACK_DIR = "/home/chip/.openclaw/media/inbound";
+const INBOUND_MEDIA_FALLBACK_MAX_AGE_MS = 10 * 60 * 1000;
+const INBOUND_MEDIA_FALLBACK_MATCH_WINDOW_MS = 3 * 60 * 1000;
 const PLUGIN_VERSION = (() => {
   try {
     const packageJson = require("../package.json") as { version?: unknown };
@@ -570,6 +573,73 @@ function extractInboundMetadataMedia(metadata?: Record<string, unknown>): Plugin
   return results;
 }
 
+function looksLikeAttachmentPlaceholder(content: string): boolean {
+  const normalized = content.trim().toLowerCase();
+  return Boolean(
+    normalized &&
+      [
+        "вложение",
+        "attachment",
+        "<media:attachment>",
+        "<media:document>",
+        "<media:image>",
+        "<media:audio>",
+        "<media:video>",
+      ].includes(normalized),
+  );
+}
+
+async function resolveInboundDirectoryFallbackMedia(event: {
+  content: string;
+  timestamp?: number;
+}): Promise<PluginInboundMedia[]> {
+  if (!looksLikeAttachmentPlaceholder(event.content)) {
+    return [];
+  }
+  const now = Date.now();
+  const eventTs =
+    typeof event.timestamp === "number" && Number.isFinite(event.timestamp)
+      ? event.timestamp
+      : now;
+  const entries = await fs.readdir(INBOUND_MEDIA_FALLBACK_DIR, { withFileTypes: true }).catch(() => []);
+  const candidates: Array<{ path: string; mtimeMs: number }> = [];
+  for (const entry of entries) {
+    if (!entry.isFile()) {
+      continue;
+    }
+    const fullPath = path.join(INBOUND_MEDIA_FALLBACK_DIR, entry.name);
+    const stats = await fs.stat(fullPath).catch(() => undefined);
+    if (!stats?.isFile()) {
+      continue;
+    }
+    const ageMs = now - stats.mtimeMs;
+    if (ageMs < 0 || ageMs > INBOUND_MEDIA_FALLBACK_MAX_AGE_MS) {
+      continue;
+    }
+    if (Math.abs(stats.mtimeMs - eventTs) > INBOUND_MEDIA_FALLBACK_MATCH_WINDOW_MS) {
+      continue;
+    }
+    candidates.push({ path: fullPath, mtimeMs: stats.mtimeMs });
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const fallback = candidates[0];
+  if (!fallback) {
+    return [];
+  }
+  const normalizedPath = normalizeInboundMediaPath(fallback.path);
+  if (!normalizedPath) {
+    return [];
+  }
+  return [
+    {
+      kind: isImagePathLike(normalizedPath) ? "image" : "document",
+      path: normalizedPath,
+      mimeType: undefined,
+      source: "metadata",
+    },
+  ];
+}
+
 function toCodexImageInputItem(media: PluginInboundMedia): CodexTurnInputItem | null {
   if (
     media.kind !== "image" &&
@@ -675,13 +745,19 @@ async function buildInboundTurnInput(event: {
   content: string;
   media?: PluginInboundMedia[];
   metadata?: Record<string, unknown>;
+  timestamp?: number;
 }): Promise<CodexTurnInputItem[]> {
   const items: CodexTurnInputItem[] = [];
   if (event.content.trim()) {
     items.push({ type: "text", text: event.content });
   }
+  const metadataMedia = extractInboundMetadataMedia(event.metadata);
+  const fallbackMedia =
+    event.media?.length || metadataMedia.length
+      ? []
+      : await resolveInboundDirectoryFallbackMedia(event);
   const seen = new Set<string>();
-  for (const media of [...(event.media ?? []), ...extractInboundMetadataMedia(event.metadata)]) {
+  for (const media of [...(event.media ?? []), ...metadataMedia, ...fallbackMedia]) {
     const item =
       toCodexImageInputItem(media) ??
       (await toCodexTextAttachmentInputItem(media)) ??
@@ -702,16 +778,6 @@ async function buildInboundTurnInput(event: {
     items.push(item);
   }
   return items;
-}
-
-function isQueueCompatibleTurnInput(
-  prompt: string,
-  input: readonly CodexTurnInputItem[] | undefined,
-): boolean {
-  if (!input?.length) {
-    return true;
-  }
-  return input.length === 1 && input[0]?.type === "text" && input[0].text === prompt;
 }
 
 function buildReplyWithButtons(text: string, buttons?: PluginInteractiveButtons): ReplyPayload {
@@ -945,6 +1011,8 @@ function buildPendingPermissionsMigrationNote(profile: PermissionsMode): string 
   return `Permissions note: ${profile === "full-access" ? "Full Access" : "Default"} will apply after the current Codex turn ends.`;
 }
 
+const TURN_PROGRESS_DELAY_MS = 12_000;
+const TURN_PROGRESS_INTERVAL_MS = 120_000;
 const PLAN_PROGRESS_DELAY_MS = 12_000;
 const REVIEW_PROGRESS_DELAY_MS = 12_000;
 const COMPACT_PROGRESS_DELAY_MS = 12_000;
@@ -1378,51 +1446,45 @@ export class CodexPluginController {
         return { handled: false };
       }
       const input = await buildInboundTurnInput(event);
-      const requiresStructuredInput = !isQueueCompatibleTurnInput(event.content, input);
       const activeKey = buildConversationKey(conversation);
       const active = this.activeRuns.get(activeKey);
       if (active) {
-        if (active.mode === "plan") {
+        const pending = this.store.getPendingRequestByConversation(conversation);
+        if (pending?.state.questionnaire && !event.content.trim().startsWith("/")) {
+          const handled = await this.handlePendingQuestionnaireFreeformAnswer(
+            conversation,
+            pending,
+            active.handle,
+            event.content,
+          );
+          if (handled) {
+            return { handled: true };
+          }
+        }
+        if (this.isImplicitStopMessage(event.content)) {
           this.api.logger.debug?.(
-            `codex inbound claim restarting active plan run conversation=${conversation.conversationId}`,
+            `codex inbound claim stopping active run via plain-text stop conversation=${conversation.conversationId}`,
           );
           this.activeRuns.delete(activeKey);
           await active.handle.interrupt().catch(() => undefined);
-        } else {
-          const pending = this.store.getPendingRequestByConversation(conversation);
-          if (pending?.state.questionnaire && !event.content.trim().startsWith("/")) {
-            const handled = await this.handlePendingQuestionnaireFreeformAnswer(
-              conversation,
-              pending,
-              active.handle,
-              event.content,
-            );
-            if (handled) {
-              return { handled: true };
-            }
-          }
-          if (requiresStructuredInput) {
-            this.api.logger.debug?.(
-              `codex inbound claim restarting active run for structured input conversation=${conversation.conversationId}`,
-            );
-          } else {
-            try {
-              const handled = await active.handle.queueMessage(event.content);
-              if (handled) {
-                return { handled: true };
-              }
-              this.api.logger.warn(
-                `codex inbound claim could not enqueue message for active run; restarting thread conversation=${conversation.conversationId}`,
-              );
-            } catch (error) {
-              this.api.logger.warn(
-                `codex inbound claim active run enqueue failed; restarting thread conversation=${conversation.conversationId}: ${String(error)}`,
-              );
-            }
-          }
-          this.activeRuns.delete(activeKey);
-          await active.handle.interrupt().catch(() => undefined);
+          await this.sendText(conversation, "Stopping Codex now.");
+          return { handled: true };
         }
+        try {
+          const handled = await active.handle.queueMessage(event.content, input);
+          if (handled) {
+            return { handled: true };
+          }
+          this.api.logger.warn(
+            `codex inbound claim could not enqueue message for active run; restarting thread conversation=${conversation.conversationId}`,
+          );
+        } catch (error) {
+          this.api.logger.warn(
+            `codex inbound claim active run enqueue failed; restarting thread conversation=${conversation.conversationId}: ${String(error)}`,
+          );
+        }
+        this.activeRuns.delete(activeKey);
+        await active.handle.interrupt().catch(() => undefined);
       }
       const existingBinding = this.store.getBinding(conversation);
       const hydratedBinding = existingBinding ? null : await this.hydrateApprovedBinding(conversation);
@@ -3489,15 +3551,9 @@ export class CodexPluginController {
         );
         this.activeRuns.delete(key);
         await existing.handle.interrupt().catch(() => undefined);
-      } else if (!isQueueCompatibleTurnInput(params.prompt, params.input)) {
-        this.api.logger.debug?.(
-          `codex turn request restarting active run for structured input ${this.formatConversationForLog(params.conversation)} mode=${existing.mode}`,
-        );
-        this.activeRuns.delete(key);
-        await existing.handle.interrupt().catch(() => undefined);
       } else {
         try {
-          const handled = await existing.handle.queueMessage(params.prompt);
+          const handled = await existing.handle.queueMessage(params.prompt, params.input);
           if (handled) {
             this.api.logger.debug?.(
               `codex turn request queued onto active run ${this.formatConversationForLog(params.conversation)} mode=${existing.mode}`,
@@ -3517,6 +3573,25 @@ export class CodexPluginController {
       }
     }
     const typing = await this.startTypingLease(params.conversation);
+    let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
+    let progressTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
+      void (async () => {
+        await this.sendText(params.conversation, "Codex is still working...");
+      })();
+      keepaliveInterval = setInterval(() => {
+        void this.sendText(params.conversation, "Codex is still working...");
+      }, TURN_PROGRESS_INTERVAL_MS);
+    }, TURN_PROGRESS_DELAY_MS);
+    const stopProgressTimer = () => {
+      if (progressTimer) {
+        clearTimeout(progressTimer);
+        progressTimer = null;
+      }
+      if (keepaliveInterval) {
+        clearInterval(keepaliveInterval);
+        keepaliveInterval = null;
+      }
+    };
     this.api.logger.debug?.(
       `codex turn starting app-server run ${this.formatConversationForLog(params.conversation)} typing=${typing ? "yes" : "no"} session=${params.binding?.sessionKey ?? "<none>"} existingThread=${params.binding?.threadId ?? "<none>"} profile=${profile} mode=${params.collaborationMode?.mode ?? "default"}`,
     );
@@ -3540,6 +3615,9 @@ export class CodexPluginController {
       sandbox: desired.sandbox,
       collaborationMode: params.collaborationMode,
       onPendingInput: async (state) => {
+        if (state) {
+          stopProgressTimer();
+        }
         this.api.logger.debug?.(
           `codex turn pending input ${state ? "received" : "cleared"} ${this.formatConversationForLog(params.conversation)} questionnaire=${state?.questionnaire ? "yes" : "no"}`,
         );
@@ -3612,7 +3690,11 @@ export class CodexPluginController {
                 result.stoppedReason !== "approval" &&
                 !result.text?.trim() &&
                 !result.planArtifact?.markdown
-              ? await this.describeEmptyTurnCompletion()
+              ? await this.describeEmptyTurnCompletion({
+                sessionKey: params.binding?.sessionKey,
+                profile,
+                threadId: result.threadId ?? params.binding?.threadId,
+              })
               : formatTurnCompletion(result);
         await this.sendText(params.conversation, completionText);
       })
@@ -3631,6 +3713,7 @@ export class CodexPluginController {
         );
       })
       .finally(async () => {
+        stopProgressTimer();
         typing?.stop();
         this.activeRuns.delete(key);
         const pending = this.store.getPendingRequestByConversation(params.conversation);
@@ -3682,7 +3765,29 @@ export class CodexPluginController {
     return `Codex failed: ${message}`;
   }
 
-  private async describeEmptyTurnCompletion(): Promise<string> {
+  private async describeEmptyTurnCompletion(params?: {
+    sessionKey?: string;
+    profile?: PermissionsMode;
+    threadId?: string;
+  }): Promise<string> {
+    const threadId = params?.threadId?.trim();
+    if (threadId) {
+      try {
+        const replay = await this.client.readThreadContext({
+          profile: params?.profile,
+          sessionKey: params?.sessionKey,
+          threadId,
+        });
+        const recovered = this.trimReplayText(replay.lastAssistantMessage, 4000);
+        if (recovered) {
+          return recovered;
+        }
+      } catch (error) {
+        this.api.logger.debug?.(
+          `codex empty completion replay recovery failed thread=${threadId}: ${String(error)}`,
+        );
+      }
+    }
     return "Codex completed without a text reply.";
   }
 
@@ -6171,6 +6276,11 @@ export class CodexPluginController {
       return trimmed;
     }
     return `${trimmed.slice(0, maxLength - 3).trimEnd()}...`;
+  }
+
+  private isImplicitStopMessage(content: string): boolean {
+    const normalized = content.trim().toLowerCase().replace(/[.!?…]+$/u, "");
+    return normalized === "stop";
   }
 
   private isWorktreePath(projectKey?: string): boolean {

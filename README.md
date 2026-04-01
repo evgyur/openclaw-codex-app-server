@@ -136,6 +136,8 @@ Pre-release packages are published on matching npm dist-tags instead of `latest`
 | `/cas_detach` | Unbind this conversation from Codex. | Stops routing plain text from this conversation into the bound thread. |
 | `/cas_stop` | Interrupt the active Codex run. | Only applies when a turn is currently in progress. |
 | `/cas_steer <message>` | Send follow-up steer text to an active run. | Example: `/cas_steer focus on the failing tests first` |
+
+When a conversation already has an active Codex run, plain text is treated as steer-by-default instead of restarting the run. To stop the active run without typing `/cas_stop`, send a plain message containing exactly `stop`.
 | `/cas_plan <goal>` | Ask Codex to plan instead of execute. | The plugin relays plan questions and the final plan back into chat. |
 | `/cas_plan off` | Exit plan mode for this conversation. | Use this when you want to leave planning manually instead of through the normal `Implement this plan` button. |
 | `/cas_review` | Review the current uncommitted changes in the bound workspace. | Requires an existing binding. |

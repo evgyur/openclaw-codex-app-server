@@ -68,7 +68,7 @@ type JsonRpcClient = {
 
 export type ActiveCodexRun = {
   result: Promise<TurnResult | ReviewResult>;
-  queueMessage: (text: string) => Promise<boolean>;
+  queueMessage: (text: string, input?: readonly CodexTurnInputItem[]) => Promise<boolean>;
   submitPendingInput: (actionIndex: number) => Promise<boolean>;
   submitPendingInputPayload: (payload: unknown) => Promise<boolean>;
   interrupt: () => Promise<void>;
@@ -1184,16 +1184,18 @@ function buildTurnSteerPayloads(params: {
   threadId: string;
   turnId: string;
   text: string;
+  input?: readonly CodexTurnInputItem[];
 }): Array<Record<string, unknown>> {
   const trimmed = params.text.trim();
-  if (!trimmed) {
+  const hasStructuredInput = Boolean(params.input?.length);
+  if (!trimmed && !hasStructuredInput) {
     return [];
   }
   return [
     {
       threadId: params.threadId,
       expectedTurnId: params.turnId,
-      input: buildTurnInput(trimmed),
+      input: buildTurnInput(trimmed, params.input),
     },
   ];
 }
@@ -1986,6 +1988,24 @@ function extractAssistantItemId(value: unknown): string | undefined {
   return pickString(item, ["id", "itemId", "item_id", "messageId", "message_id"]);
 }
 
+function normalizeAssistantItemType(value: unknown): string {
+  return (
+    pickString(asRecord(value) ?? {}, ["type"])
+      ?.trim()
+      .toLowerCase()
+      .replace(/[^a-z]/g, "") ?? ""
+  );
+}
+
+function isAssistantMessageItemType(value: unknown): boolean {
+  const normalized = normalizeAssistantItemType(value);
+  return (
+    normalized === "agentmessage" ||
+    normalized === "assistantmessage" ||
+    normalized === "chatkitassistantmessage"
+  );
+}
+
 function extractAssistantTextFromItemPayload(
   value: unknown,
   options?: { streaming?: boolean },
@@ -1995,8 +2015,7 @@ function extractAssistantTextFromItemPayload(
     return "";
   }
   const item = asRecord(record.item) ?? record;
-  const itemType = pickString(item, ["type"])?.toLowerCase();
-  if (itemType !== "agentmessage") {
+  if (!isAssistantMessageItemType(item)) {
     return "";
   }
   return options?.streaming
@@ -2004,12 +2023,46 @@ function extractAssistantTextFromItemPayload(
     : (pickString(item, ["text"], { trim: false }) ?? collectStreamingText(item));
 }
 
+function extractAssistantTextFromTerminalPayload(value: unknown): string {
+  const direct = extractAssistantTextFromItemPayload(value);
+  if (direct.trim()) {
+    return direct;
+  }
+  const arrays = [
+    findFirstArrayByKeys(value, ["output"]),
+    findFirstArrayByKeys(value, ["items"]),
+    findFirstArrayByKeys(value, ["messages"]),
+    findFirstArrayByKeys(value, ["content"]),
+  ].filter(Array.isArray);
+  for (const entries of arrays) {
+    const combined = dedupeJoinedText(
+      entries
+        .map((entry) => extractAssistantTextFromItemPayload(entry))
+        .filter((entry) => entry.trim()),
+    );
+    if (combined) {
+      return combined;
+    }
+  }
+  return (
+    findFirstNestedString(
+      value,
+      ["assistantText", "assistant_text"],
+      ["assistantText", "assistant_text"],
+    ) ?? ""
+  );
+}
+
 function extractAssistantNotificationText(
   method: string,
   params: unknown,
 ): { mode: "delta" | "snapshot" | "ignore"; text: string; itemId?: string } {
   const methodLower = method.trim().toLowerCase();
-  if (methodLower === "item/agentmessage/delta") {
+  const normalizedMethod = methodLower.replace(/[^a-z/]/g, "");
+  if (
+    normalizedMethod === "item/agentmessage/delta" ||
+    normalizedMethod === "item/assistantmessage/delta"
+  ) {
     return {
       mode: "delta",
       text: collectStreamingText(params),
@@ -2020,6 +2073,18 @@ function extractAssistantNotificationText(
     return {
       mode: "snapshot",
       text: extractAssistantTextFromItemPayload(params),
+      itemId: extractAssistantItemId(params),
+    };
+  }
+  if (
+    (methodLower === "turn/completed" ||
+      methodLower === "turn/failed" ||
+      methodLower === "turn/cancelled") &&
+    !extractTurnTerminalState(method, params)?.error
+  ) {
+    return {
+      mode: "snapshot",
+      text: extractAssistantTextFromTerminalPayload(params),
       itemId: extractAssistantItemId(params),
     };
   }
@@ -3180,10 +3245,10 @@ export class CodexAppServerClient {
         removeNotificationListener();
         removeRequestListener();
       }),
-      queueMessage: async (text) => {
+      queueMessage: async (text, input) => {
         const trimmed = text.trim();
         const pendingInput = pendingInputCoordinator.current();
-        if (!trimmed || !pendingInput) {
+        if (!trimmed || !pendingInput || input?.length) {
           return false;
         }
         const actionSelectionCount =
@@ -3298,6 +3363,34 @@ export class CodexAppServerClient {
     const fileEditNoticeBatcher = createFileEditNoticeBatcher({
       onFlush: params.onFileEdits,
     });
+    const bufferedSteerMessages: string[] = [];
+    let flushingBufferedSteers = false;
+    const flushBufferedSteerMessages = async (source: string) => {
+      if (flushingBufferedSteers || bufferedSteerMessages.length === 0 || !threadId || !turnId) {
+        return;
+      }
+      flushingBufferedSteers = true;
+      try {
+        const client = await getClient();
+        while (bufferedSteerMessages.length > 0 && threadId && turnId) {
+          const text = bufferedSteerMessages.shift()?.trim() ?? "";
+          if (!text) {
+            continue;
+          }
+          await requestWithFallbacks({
+            client,
+            methods: [...TURN_STEER_METHODS],
+            payloads: buildTurnSteerPayloads({ threadId, turnId, text }),
+            timeoutMs: this.settings.requestTimeoutMs,
+          });
+          this.logger.debug(
+            `codex turn flushed buffered steer run=${params.runId} thread=${threadId} turn=${turnId} source=${source} prompt="${summarizeTextForLog(text, 80)}"`,
+          );
+        }
+      } finally {
+        flushingBufferedSteers = false;
+      }
+    };
     let completeTurn: (() => void) | null = null;
     const completion = new Promise<void>((resolve) => {
       completeTurn = () => {
@@ -3321,6 +3414,7 @@ export class CodexAppServerClient {
         }
         threadId ||= ids.threadId ?? "";
         turnId ||= ids.runId ?? "";
+        await flushBufferedSteerMessages(`notification:${methodLower}`);
         const tokenUsage = extractThreadTokenUsageSnapshot(notificationParams);
         if (tokenUsage) {
           latestContextUsage = tokenUsage;
@@ -3597,6 +3691,7 @@ export class CodexAppServerClient {
         const startedIds = extractIds(started);
         threadId ||= startedIds.threadId ?? "";
         turnId ||= startedIds.runId ?? "";
+        await flushBufferedSteerMessages("turn/start");
         this.logger.debug(
           `codex turn started run=${params.runId} thread=${threadId || "<none>"} turn=${turnId || "<none>"}`,
         );
@@ -3651,13 +3746,17 @@ export class CodexAppServerClient {
         removeNotificationListener();
         removeRequestListener();
       }),
-      queueMessage: async (text) => {
+      queueMessage: async (text, input) => {
         const trimmed = text.trim();
-        if (!trimmed) {
+        const hasStructuredInput = Boolean(input?.length);
+        if (!trimmed && !hasStructuredInput) {
           return false;
         }
         const pendingInput = pendingInputCoordinator.current();
         if (pendingInput) {
+          if (hasStructuredInput) {
+            return false;
+          }
           const actionSelectionCount =
             pendingInput.actions.filter((action) => action.kind !== "steer").length ||
             pendingInput.options.length;
@@ -3682,25 +3781,25 @@ export class CodexAppServerClient {
           );
           return true;
         }
-        if (!threadId) {
-          this.logger.debug(`codex turn queue rejected before thread assignment run=${params.runId}`);
-          return false;
-        }
-        if (!turnId) {
-          this.logger.warn(
-            `codex turn queue rejected without active turn run=${params.runId} thread=${threadId}`,
+        if (!threadId || !turnId) {
+          if (hasStructuredInput) {
+            return false;
+          }
+          bufferedSteerMessages.push(trimmed);
+          this.logger.debug(
+            `codex turn buffered steer before active turn run=${params.runId} thread=${threadId || "<pending>"} turn=${turnId || "<pending>"} queued=${bufferedSteerMessages.length} prompt="${summarizeTextForLog(trimmed, 80)}"`,
           );
-          return false;
+          return true;
         }
         const client = await getClient();
         await requestWithFallbacks({
           client,
           methods: [...TURN_STEER_METHODS],
-          payloads: buildTurnSteerPayloads({ threadId, turnId, text: trimmed }),
+          payloads: buildTurnSteerPayloads({ threadId, turnId, text: trimmed, input }),
           timeoutMs: this.settings.requestTimeoutMs,
         });
         this.logger.debug(
-          `codex turn queued steer message run=${params.runId} thread=${threadId} turn=${turnId || "<none>"} prompt="${summarizeTextForLog(trimmed, 80)}"`,
+          `codex turn queued steer message run=${params.runId} thread=${threadId} turn=${turnId || "<none>"} structured=${hasStructuredInput ? "yes" : "no"} prompt="${summarizeTextForLog(trimmed || "[structured-input]", 80)}"`,
         );
         return true;
       },
@@ -3902,6 +4001,8 @@ export const __testing = {
   createFileEditNoticeBatcher,
   createPendingInputCoordinator,
   extractApprovalDecision,
+  extractAssistantNotificationText,
+  extractAssistantTextFromTerminalPayload,
   extractTurnTerminalState,
   extractFileEditSummariesFromNotification,
   extractFileChangePathsFromReadResult,

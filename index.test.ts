@@ -5,6 +5,8 @@ const controllerState = vi.hoisted(() => ({
   createService: vi.fn(() => ({ start: vi.fn(), stop: vi.fn() })),
   handleConversationBindingResolved: vi.fn(),
   handleInboundClaim: vi.fn(),
+  handleMessageTranscribed: vi.fn(),
+  handleMessagePreprocessed: vi.fn(),
   handleTelegramInteractive: vi.fn(),
   handleDiscordInteractive: vi.fn(),
   handleCommand: vi.fn(),
@@ -15,6 +17,8 @@ vi.mock("./src/controller.js", () => ({
     createService = controllerState.createService;
     handleConversationBindingResolved = controllerState.handleConversationBindingResolved;
     handleInboundClaim = controllerState.handleInboundClaim;
+    handleMessageTranscribed = controllerState.handleMessageTranscribed;
+    handleMessagePreprocessed = controllerState.handleMessagePreprocessed;
     handleTelegramInteractive = controllerState.handleTelegramInteractive;
     handleDiscordInteractive = controllerState.handleDiscordInteractive;
     handleCommand = controllerState.handleCommand;
@@ -29,12 +33,23 @@ describe("plugin registration", () => {
       registerService: vi.fn(),
       registerInteractiveHandler: vi.fn(),
       registerCommand: vi.fn(),
+      registerHook: vi.fn(),
       on: vi.fn(),
     };
 
     expect(() => plugin.register(api as never)).not.toThrow();
     expect(api.registerService).toHaveBeenCalledTimes(1);
     expect(api.on).toHaveBeenCalledWith("inbound_claim", expect.any(Function));
+    expect(api.registerHook).toHaveBeenCalledWith(
+      "message:transcribed",
+      expect.any(Function),
+      { name: "chipcdx-message-transcribed" },
+    );
+    expect(api.registerHook).toHaveBeenCalledWith(
+      "message:preprocessed",
+      expect.any(Function),
+      { name: "chipcdx-message-preprocessed" },
+    );
     expect(api.registerInteractiveHandler).toHaveBeenCalledTimes(2);
     expect(api.registerCommand).toHaveBeenCalled();
     expect(api.registerCommand.mock.calls.map(([params]) => params.name)).toEqual(

@@ -26,6 +26,32 @@ const plugin = {
       return await controller.handleInboundClaim(event);
     });
 
+    const registerHook = (
+      api as OpenClawPluginApi & {
+        registerHook?: (
+          events: string | string[],
+          handler: (event: unknown) => Promise<void> | void,
+          opts?: { name?: string },
+        ) => void;
+      }
+    ).registerHook;
+    if (typeof registerHook === "function") {
+      registerHook(
+        "message:transcribed",
+        async (event) => {
+          await controller.handleMessageTranscribed(event as never);
+        },
+        { name: "chipcdx-message-transcribed" },
+      );
+      registerHook(
+        "message:preprocessed",
+        async (event) => {
+          await controller.handleMessagePreprocessed(event as never);
+        },
+        { name: "chipcdx-message-preprocessed" },
+      );
+    }
+
     api.registerInteractiveHandler({
       channel: "telegram",
       namespace: INTERACTIVE_NAMESPACE,

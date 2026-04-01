@@ -161,6 +161,29 @@ describe("buildTurnSteerPayloads", () => {
       },
     ]);
   });
+
+  it("preserves structured image input for turn/steer", () => {
+    expect(
+      __testing.buildTurnSteerPayloads({
+        threadId: "thread-123",
+        turnId: "turn-456",
+        text: "describe this",
+        input: [
+          { type: "text", text: "describe this" },
+          { type: "localImage", path: "/tmp/screenshot.png" },
+        ],
+      }),
+    ).toEqual([
+      {
+        threadId: "thread-123",
+        expectedTurnId: "turn-456",
+        input: [
+          { type: "text", text: "describe this" },
+          { type: "localImage", path: "/tmp/screenshot.png" },
+        ],
+      },
+    ]);
+  });
 });
 
 describe("buildThreadResumePayloads", () => {
@@ -769,6 +792,36 @@ describe("turn stop detection", () => {
         hasPlanArtifact: false,
       }),
     ).toBe("cancelled");
+  });
+});
+
+describe("extractAssistantNotificationText", () => {
+  it("accepts assistant_message delta notifications as assistant output", () => {
+    expect(
+      __testing.extractAssistantNotificationText("item/assistant_message/delta", {
+        item: { id: "msg-1", type: "assistant_message" },
+        delta: "ready",
+      }),
+    ).toEqual({ mode: "delta", text: "ready", itemId: "msg-1" });
+  });
+
+  it("extracts assistant text from completed assistant_message items", () => {
+    expect(
+      __testing.extractAssistantNotificationText("item/completed", {
+        item: { id: "msg-2", type: "assistant_message", text: "Ship it." },
+      }),
+    ).toEqual({ mode: "snapshot", text: "Ship it.", itemId: "msg-2" });
+  });
+
+  it("recovers assistant text from turn/completed payloads", () => {
+    expect(
+      __testing.extractAssistantNotificationText("turn/completed", {
+        turn: {
+          status: "completed",
+          output: [{ type: "assistant_message", text: "Final answer." }],
+        },
+      }),
+    ).toEqual({ mode: "snapshot", text: "Final answer.", itemId: undefined });
   });
 });
 
