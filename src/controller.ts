@@ -28,7 +28,7 @@ import {
   resolveTelegramToken,
   sendMessageTelegram,
   sendTypingTelegram,
-} from "openclaw/plugin-sdk/telegram";
+} from "./telegram-runtime.js";
 import { resolvePluginSettings, resolveWorkspaceDir } from "./config.js";
 import { CodexAppServerModeClient, type ActiveCodexRun, isMissingThreadError } from "./client.js";
 import { getThreadDisplayTitle } from "./thread-display.js";
@@ -6850,21 +6850,15 @@ export class CodexPluginController {
   }
 
   private async resolveTelegramBotToken(accountId?: string): Promise<string | undefined> {
-    const telegramRuntime = (this.api.runtime.channel as {
+    const telegramRuntime = ((this.api.runtime.channel as unknown) as {
       telegram?: {
-        resolveTelegramToken?: typeof resolveTelegramToken;
+        resolveTelegramToken?: (cfg?: unknown, opts?: unknown) => unknown | Promise<unknown>;
       };
     }).telegram;
     const resolution = telegramRuntime?.resolveTelegramToken
-      ? telegramRuntime.resolveTelegramToken(
-          this.lastRuntimeConfig as Parameters<typeof resolveTelegramToken>[0],
-          { accountId },
-        )
-      : resolveTelegramToken(
-          this.lastRuntimeConfig as Parameters<typeof resolveTelegramToken>[0],
-          { accountId },
-        );
-    const token = resolution?.token?.trim();
+      ? await telegramRuntime.resolveTelegramToken(this.lastRuntimeConfig, { accountId })
+      : await resolveTelegramToken(this.lastRuntimeConfig, { accountId });
+    const token = (resolution as { token?: string } | undefined)?.token?.trim();
     return token || undefined;
   }
 
@@ -6969,7 +6963,7 @@ export class CodexPluginController {
               cfg: this.lastRuntimeConfig as NonNullable<Parameters<typeof renameForumTopicTelegram>[3]>["cfg"],
               accountId: conversation.accountId,
             },
-          )).catch((error) => {
+          )).catch((error: unknown) => {
         this.api.logger.warn(`codex telegram topic rename failed: ${String(error)}`);
       });
       return;

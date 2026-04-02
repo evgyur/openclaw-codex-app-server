@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,7 +13,7 @@ mkdirSync(tarballDir, { recursive: true });
 mkdirSync(installDir, { recursive: true });
 
 try {
-  exec("pnpm", ["pack", "--pack-destination", tarballDir]);
+  exec("corepack", ["pnpm", "pack", "--pack-destination", tarballDir]);
 
   const tarballs = readdirSync(tarballDir)
     .filter((entry) => entry.endsWith(".tgz"))
@@ -66,6 +66,16 @@ try {
     if (existsSync(path.join(packageDir, relativePath))) {
       throw new Error(`Found unexpected published file: ${relativePath}`);
     }
+  }
+
+  const publishedPackageJson = JSON.parse(
+    readFileSync(path.join(packageDir, "package.json"), "utf8"),
+  );
+  if (publishedPackageJson.dependencies?.openclaw) {
+    throw new Error("Published package must not depend on nested openclaw runtime.");
+  }
+  if (publishedPackageJson.peerDependencies?.openclaw) {
+    throw new Error("Published package must not advertise openclaw as a peer dependency.");
   }
 
   process.stdout.write(`pack smoke ok (${tempRoot})\n`);
