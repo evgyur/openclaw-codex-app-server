@@ -53,6 +53,9 @@
       },
       "defaultServiceTier": {
         "type": "string"
+      },
+      "enableDiscordInteractive": {
+        "type": "boolean"
       }
     }
   },
@@ -99,6 +102,11 @@
     },
     "defaultServiceTier": {
       "label": "Default Service Tier",
+      "advanced": true
+    },
+    "enableDiscordInteractive": {
+      "label": "Enable Discord Interactive (legacy compat)",
+      "help": "Deprecated compatibility flag kept so existing local configs continue to validate during cockpit upgrades.",
       "advanced": true
     }
   }
