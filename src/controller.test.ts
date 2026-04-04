@@ -23,19 +23,11 @@ const discordSdkState = vi.hoisted(() => ({
   resolveDiscordAccount: vi.fn(() => ({ accountId: "default" })),
 }));
 
-const telegramSdkState = vi.hoisted(() => ({
-  resolveTelegramAccount: vi.fn(() => ({ accountId: "default", token: "telegram-token" })),
-}));
-
 vi.mock("openclaw/plugin-sdk/discord", () => ({
   buildDiscordComponentMessage: discordSdkState.buildDiscordComponentMessage,
   editDiscordComponentMessage: discordSdkState.editDiscordComponentMessage,
   registerBuiltDiscordComponentMessage: discordSdkState.registerBuiltDiscordComponentMessage,
   resolveDiscordAccount: discordSdkState.resolveDiscordAccount,
-}));
-
-vi.mock("openclaw/plugin-sdk/telegram-account", () => ({
-  resolveTelegramAccount: telegramSdkState.resolveTelegramAccount,
 }));
 
 function makeStateDir(): string {
@@ -413,7 +405,6 @@ beforeEach(() => {
   discordSdkState.editDiscordComponentMessage.mockClear();
   discordSdkState.registerBuiltDiscordComponentMessage.mockClear();
   discordSdkState.resolveDiscordAccount.mockClear();
-  telegramSdkState.resolveTelegramAccount.mockClear();
   vi.spyOn(CodexAppServerClient.prototype, "logStartupProbe").mockResolvedValue();
   vi.stubGlobal(
     "fetch",

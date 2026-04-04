@@ -7241,18 +7241,23 @@ export class CodexPluginController {
     if (!cfg) {
       return undefined;
     }
-    try {
-      const telegramAccount = await import("openclaw/plugin-sdk/telegram-account");
-      const account = telegramAccount.resolveTelegramAccount({
-        cfg,
-        accountId,
-      });
-      const token = account?.token?.trim();
-      return token || undefined;
-    } catch (error) {
-      this.api.logger.debug?.(`codex telegram account facade unavailable: ${String(error)}`);
-      return undefined;
-    }
+    const root = asRecord(cfg);
+    const channels = asRecord(root?.channels);
+    const telegram = asRecord(channels?.telegram);
+    const accounts = asRecord(telegram?.accounts);
+    const normalizedAccountId = accountId?.trim() || "default";
+    const configuredDefaultAccount =
+      typeof telegram?.defaultAccount === "string" && telegram.defaultAccount.trim()
+        ? telegram.defaultAccount.trim()
+        : undefined;
+    const account =
+      asRecord(accounts?.[normalizedAccountId]) ??
+      asRecord(accounts?.[configuredDefaultAccount ?? ""]) ??
+      asRecord(accounts?.default);
+    const tokenCandidates = [account?.token, telegram?.token]
+      .map((value) => (typeof value === "string" ? value.trim() : ""))
+      .filter(Boolean);
+    return tokenCandidates[0] || undefined;
   }
 
   private async resolveDiscordBotToken(accountId?: string): Promise<string | undefined> {
