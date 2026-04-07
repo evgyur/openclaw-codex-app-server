@@ -270,6 +270,63 @@ export type TurnResult = {
   usage?: ContextUsageSnapshot;
 };
 
+export type TaskStage =
+  | "intake"
+  | "clarifying"
+  | "planned"
+  | "executing"
+  | "verifying"
+  | "done"
+  | "blocked";
+
+export type VerificationStatus =
+  | "unverified"
+  | "partial"
+  | "verified"
+  | "verified-risk"
+  | "stale";
+
+export type TaskVerificationRecord = {
+  status: VerificationStatus;
+  summary?: string;
+  residualRisk?: string;
+  staleAt?: number;
+  updatedAt: number;
+};
+
+export type TaskCheckpoint = {
+  summary: string;
+  nextAction?: string;
+  savedAt: number;
+};
+
+export type TaskCardState = {
+  goal?: string;
+  stage?: TaskStage;
+  nextAction?: string;
+  latestEvidence?: string;
+  blocker?: string;
+  lastHeartbeatAt?: number;
+  verification?: TaskVerificationRecord;
+  checkpoint?: TaskCheckpoint;
+  updatedAt: number;
+};
+
+export type ActiveTurnRecoveryState = {
+  runId: string;
+  mode: "default" | "plan";
+  workspaceDir: string;
+  prompt: string;
+  reason: "command" | "inbound" | "plan";
+  collaborationMode?: CollaborationMode;
+  threadId?: string;
+  baselineAssistantMessage?: string;
+  startedAt: number;
+  lastHeartbeatAt: number;
+  recoveryAttemptCount: number;
+  status: "running" | "orphaned";
+};
+
 export type StoredBinding = {
   conversation: ConversationRef;
   sessionKey: string;
@@ -281,6 +338,8 @@ export type StoredBinding = {
   pinnedBindingMessage?: InteractiveMessageRef;
   contextUsage?: ContextUsageSnapshot;
   preferences?: ConversationPreferences;
+  taskState?: TaskCardState;
+  activeTurn?: ActiveTurnRecoveryState;
   updatedAt: number;
 };
 
@@ -466,6 +525,27 @@ export type CallbackAction =
   | {
       token: string;
       kind: "stop-run";
+      conversation: ConversationRef;
+      createdAt: number;
+      expiresAt: number;
+    }
+  | {
+      token: string;
+      kind: "resume-task";
+      conversation: ConversationRef;
+      createdAt: number;
+      expiresAt: number;
+    }
+  | {
+      token: string;
+      kind: "mark-verified";
+      conversation: ConversationRef;
+      createdAt: number;
+      expiresAt: number;
+    }
+  | {
+      token: string;
+      kind: "clear-task-blocker";
       conversation: ConversationRef;
       createdAt: number;
       expiresAt: number;

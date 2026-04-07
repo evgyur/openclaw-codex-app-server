@@ -8,6 +8,7 @@ import { CodexAppServerClient } from "./client.js";
 import { CodexPluginController } from "./controller.js";
 
 const TEST_TELEGRAM_PEER_ID = "telegram-user-1";
+const DISCORD_SDK_OVERRIDE_KEY = "__OPENCLAW_CODEX_APP_SERVER_TEST_DISCORD_SDK__";
 
 const discordSdkState = vi.hoisted(() => ({
   buildDiscordComponentMessage: vi.fn((params: { spec: { text?: string; blocks?: unknown[] } }) => ({
@@ -20,22 +21,16 @@ const discordSdkState = vi.hoisted(() => ({
     channelId: "channel:chan-1",
   })),
   registerBuiltDiscordComponentMessage: vi.fn(),
-  resolveDiscordAccount: vi.fn(() => ({ accountId: "default" })),
+  resolveDiscordAccount: vi.fn(() => ({ accountId: "default", token: "discord-token" })),
 }));
 
-vi.mock("openclaw/plugin-sdk/discord", () => ({
-  buildDiscordComponentMessage: discordSdkState.buildDiscordComponentMessage,
-  editDiscordComponentMessage: discordSdkState.editDiscordComponentMessage,
-  registerBuiltDiscordComponentMessage: discordSdkState.registerBuiltDiscordComponentMessage,
-  resolveDiscordAccount: discordSdkState.resolveDiscordAccount,
-}));
+(globalThis as typeof globalThis & Record<string, unknown>)[DISCORD_SDK_OVERRIDE_KEY] = discordSdkState;
 
 function makeStateDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-app-server-test-"));
 }
 
-function createApiMock() {
-  const stateDir = makeStateDir();
+function createApiMock(stateDir = makeStateDir()) {
   const sendComponentMessage = vi.fn(async (..._args: unknown[]) => ({ messageId: "discord-component-1", channelId: "channel:chan-1" }));
   const sendMessageDiscord = vi.fn(async (..._args: unknown[]) => ({ messageId: "discord-msg-1", channelId: "channel:chan-1" }));
   const sendMessageTelegram = vi.fn(async (..._args: unknown[]) => ({ messageId: "1", chatId: "123" }));
@@ -181,6 +176,8 @@ async function createControllerHarness() {
     sandbox: "workspace-write",
   };
   const clientMock = {
+    logStartupProbe: vi.fn(async () => {}),
+    close: vi.fn(async () => {}),
     hasProfile: vi.fn((profile: string) => profile === "default" || profile === "full-access"),
     listThreads: vi.fn(async () => [
       {
@@ -247,6 +244,96 @@ async function createControllerHarness() {
   };
   (controller as any).client = clientMock;
   (controller as any).readThreadHasChanges = vi.fn(async () => false);
+  return {
+    controller,
+    api,
+    clientMock,
+    sendComponentMessage,
+    sendMessageDiscord,
+    sendMessageTelegram,
+    discordTypingStart,
+    renameTopic,
+    resolveTelegramToken,
+    editChannel,
+    stateDir,
+  };
+}
+
+async function createRecoveryHarness(stateDir = makeStateDir(), options?: { autoStart?: boolean }) {
+  const {
+    api,
+    sendComponentMessage,
+    sendMessageDiscord,
+    sendMessageTelegram,
+    discordTypingStart,
+    renameTopic,
+    resolveTelegramToken,
+    editChannel,
+  } = createApiMock(stateDir);
+  const controller = new CodexPluginController(api);
+  const threadState: any = {
+    threadId: "thread-1",
+    threadName: "Discord Thread",
+    model: "openai/gpt-5.4",
+    cwd: "/repo/openclaw",
+    serviceTier: "default",
+    approvalPolicy: "on-request",
+    sandbox: "workspace-write",
+  };
+  const clientMock = {
+    logStartupProbe: vi.fn(async () => {}),
+    close: vi.fn(async () => {}),
+    hasProfile: vi.fn((profile: string) => profile === "default" || profile === "full-access"),
+    listThreads: vi.fn(async () => []),
+    startThread: vi.fn(async () => ({
+      threadId: "thread-new",
+      threadName: "New Thread",
+      model: "openai/gpt-5.4",
+      cwd: "/repo/openclaw",
+      serviceTier: "default",
+    })),
+    listModels: vi.fn(async () => [
+      { id: "openai/gpt-5.4", current: true },
+      { id: "openai/gpt-5.3" },
+    ]),
+    listSkills: vi.fn(async () => []),
+    listMcpServers: vi.fn(async () => []),
+    readThreadState: vi.fn(async () => ({ ...threadState })),
+    readThreadContext: vi.fn(async () => ({
+      lastUserMessage: undefined,
+      lastAssistantMessage: undefined,
+    })),
+    setThreadName: vi.fn(async () => ({
+      threadId: "thread-1",
+      threadName: "Discord Thread",
+    })),
+    setThreadModel: vi.fn(async () => ({ ...threadState })),
+    setThreadServiceTier: vi.fn(async () => ({ ...threadState })),
+    setThreadPermissions: vi.fn(async () => ({ ...threadState })),
+    startTurn: vi.fn(() => {
+      throw new Error("startTurn not mocked");
+    }),
+    startReview: vi.fn(() => ({
+      result: new Promise(() => {}),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => false),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    })),
+    readAccount: vi.fn(async () => ({
+      email: "test@example.com",
+      planType: "pro",
+      type: "chatgpt",
+    })),
+    readRateLimits: vi.fn(async () => []),
+  };
+  (controller as any).client = clientMock;
+  (controller as any).readThreadHasChanges = vi.fn(async () => false);
+  if (options?.autoStart !== false) {
+    await controller.start();
+  }
   return {
     controller,
     api,
@@ -441,7 +528,8 @@ describe("Discord controller flows", () => {
         conversationId: "channel:chan-1",
       },
       workspaceDir: "/repo/openclaw",
-      mode: "default",
+      mode: "review",
+      runId: "run-1",
       handle: {
         result: Promise.resolve({ threadId: "thread-1", aborted: true }),
         queueMessage: vi.fn(async () => false),
@@ -1866,6 +1954,55 @@ describe("Discord controller flows", () => {
       ]),
     );
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("adds inline task controls to the status card for resumable work", async () => {
+    const { controller, sendMessageTelegram } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      taskState: {
+        goal: "Ship the long-lived cockpit flow",
+        stage: "blocked",
+        nextAction: "Resume from the last checkpoint",
+        blocker: "Codex paused for approval",
+        checkpoint: {
+          summary: "Codex paused for approval",
+          nextAction: "Review or approve the pending Codex action",
+          savedAt: Date.now(),
+        },
+        updatedAt: Date.now(),
+      },
+      updatedAt: Date.now(),
+    });
+
+    const reply = await controller.handleCommand(
+      "cas_status",
+      buildTelegramCommandContext({
+        commandBody: "/cas_status",
+        getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
+      }),
+    );
+
+    expect(reply).toEqual({});
+    const firstCall = sendMessageTelegram.mock.calls[0] as unknown as
+      | [string, string, { buttons?: Array<Array<{ text: string; callback_data: string }>> }]
+      | undefined;
+    const buttonLabels = firstCall?.[2]?.buttons?.flat().map((button) => button.text) ?? [];
+    expect(buttonLabels).toEqual(expect.arrayContaining(["Resume", "Mark verified", "Clear blocker"]));
+    const kinds = (firstCall?.[2]?.buttons ?? []).flatMap((row: Array<{ callback_data: string }>) =>
+      row.map((button) => {
+        const token = button.callback_data.split(":").pop() ?? "";
+        return (controller as any).store.getCallback(token)?.kind;
+      }),
+    );
+    expect(kinds).toEqual(expect.arrayContaining(["resume-task", "mark-verified", "clear-task-blocker"]));
   });
 
   it("falls back to the legacy Telegram runtime when outbound adapters are unavailable", async () => {
@@ -3631,6 +3768,56 @@ describe("Discord controller flows", () => {
     });
 
     expect(result).toEqual({ handled: false });
+  });
+
+  it("blocks inbound turns and explains recovery when the bound thread is permanently missing", async () => {
+    const { controller, sendMessageTelegram } = await createControllerHarness();
+    const startTurn = vi.fn();
+    (controller as any).client.readThreadState = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new Error("codex app server rpc error (-32600): no rollout found for thread id thread-stale"),
+      )
+      .mockRejectedValueOnce(
+        new Error("codex app server rpc error (-32600): no rollout found for thread id thread-stale"),
+      );
+    (controller as any).startTurn = startTurn;
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      },
+      sessionKey: "session-stale",
+      threadId: "thread-stale",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+
+    const result = await controller.handleInboundClaim({
+      content: "continue",
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123:topic:456",
+      parentConversationId: "123",
+      threadId: 456,
+    });
+
+    expect(result).toEqual({ handled: true });
+    expect(startTurn).not.toHaveBeenCalled();
+    const binding = (controller as any).store.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123:topic:456",
+      parentConversationId: "123",
+    });
+    expect(binding?.taskState?.blocker).toBe("Bound Codex thread is no longer available");
+    expect(sendMessageTelegram).toHaveBeenCalledWith(
+      "123",
+      expect.stringContaining("The bound Codex thread `thread-stale` is no longer available."),
+      expect.objectContaining({ accountId: "default", messageThreadId: 456 }),
+    );
   });
 
   it("uses a raw Discord channel id for the typing lease on inbound claims", async () => {
@@ -6593,5 +6780,1383 @@ describe("Discord controller flows", () => {
     });
     // The callback should be removed from the store
     expect((controller as any).store.getCallback(callback.token)).toBeNull();
+  });
+
+  it("updates task-card fields through cas_task and renders them in cas_status", async () => {
+    const { controller, sendMessageTelegram } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+
+    const goalReply = await controller.handleCommand("cas_task", buildTelegramCommandContext({
+      args: "goal Ship the prod-safe cockpit task card",
+      commandBody: "/cas_task goal Ship the prod-safe cockpit task card",
+      getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
+    }));
+    const stageReply = await controller.handleCommand("cas_task", buildTelegramCommandContext({
+      args: "stage executing",
+      commandBody: "/cas_task stage executing",
+      getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
+    }));
+    const nextReply = await controller.handleCommand("cas_task", buildTelegramCommandContext({
+      args: "next Run the prod smoke checks",
+      commandBody: "/cas_task next Run the prod smoke checks",
+      getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
+    }));
+    const evidenceReply = await controller.handleCommand("cas_task", buildTelegramCommandContext({
+      args: "evidence Local vitest is green",
+      commandBody: "/cas_task evidence Local vitest is green",
+      getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
+    }));
+    const blockerReply = await controller.handleCommand("cas_task", buildTelegramCommandContext({
+      args: "blocker Waiting for the Telegram reply path",
+      commandBody: "/cas_task blocker Waiting for the Telegram reply path",
+      getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
+    }));
+
+    expect(goalReply.text).toContain("Goal: Ship the prod-safe cockpit task card");
+    expect(stageReply.text).toContain("Stage: executing");
+    expect(nextReply.text).toContain("Next action: Run the prod smoke checks");
+    expect(evidenceReply.text).toContain("Latest evidence: Local vitest is green");
+    expect(blockerReply.text).toContain("Blocker: Waiting for the Telegram reply path");
+
+    const statusReply = await controller.handleCommand("cas_status", buildTelegramCommandContext({
+      commandBody: "/cas_status",
+      getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
+    }));
+
+    expect(statusReply).toEqual({});
+    expect(sendMessageTelegram).toHaveBeenLastCalledWith(
+      "123",
+      expect.stringContaining("Task card:"),
+      expect.objectContaining({
+        accountId: "default",
+        buttons: expect.any(Array),
+      }),
+    );
+    const lastStatusText = sendMessageTelegram.mock.calls.at(-1)?.[1] as string;
+    expect(lastStatusText).toContain("Goal: Ship the prod-safe cockpit task card");
+    expect(lastStatusText).toContain("Stage: executing");
+    expect(lastStatusText).toContain("Next action: Run the prod smoke checks");
+    expect(lastStatusText).toContain("Latest evidence: Local vitest is green");
+    expect(lastStatusText).toContain("Blocker: Waiting for the Telegram reply path");
+  });
+
+  it("stores verification and checkpoint state through cas_verify and cas_checkpoint", async () => {
+    const { controller, sendMessageTelegram } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+
+    const verifyReply = await controller.handleCommand("cas_verify", buildTelegramCommandContext({
+      args: "verified Local tests and host-side typecheck passed",
+      commandBody: "/cas_verify verified Local tests and host-side typecheck passed",
+      getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
+    }));
+    const checkpointReply = await controller.handleCommand("cas_checkpoint", buildTelegramCommandContext({
+      args: "save Runtime artifact is ready --next Copy to ~/.openclaw/extensions and run /cas_status",
+      commandBody: "/cas_checkpoint save Runtime artifact is ready --next Copy to ~/.openclaw/extensions and run /cas_status",
+      getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
+    }));
+
+    expect(verifyReply.text).toContain("Verification: Verified");
+    expect(verifyReply.text).toContain("Local tests and host-side typecheck passed");
+    expect(checkpointReply.text).toContain("Checkpoint: Runtime artifact is ready");
+    expect(checkpointReply.text).toContain("Checkpoint next: Copy to ~/.openclaw/extensions and run /cas_status");
+
+    const statusReply = await controller.handleCommand("cas_status", buildTelegramCommandContext({
+      commandBody: "/cas_status",
+      getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
+    }));
+
+    expect(statusReply).toEqual({});
+    const lastStatusText = sendMessageTelegram.mock.calls.at(-1)?.[1] as string;
+    expect(lastStatusText).toContain("Verification: Verified");
+    expect(lastStatusText).toContain("Verification summary: Local tests and host-side typecheck passed");
+    expect(lastStatusText).toContain("Checkpoint: Runtime artifact is ready");
+    expect(lastStatusText).toContain("Checkpoint next: Copy to ~/.openclaw/extensions and run /cas_status");
+  });
+
+  it("refreshes a pinned Telegram status card in place after task-state updates", async () => {
+    const { controller } = await createControllerHarness();
+    const updateStatusCardMessage = vi.spyOn(controller as any, "updateStatusCardMessage");
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+        threadId: 456,
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      pinnedBindingMessage: {
+        provider: "telegram",
+        messageId: "99",
+        chatId: "123",
+      },
+      updatedAt: Date.now(),
+    });
+
+    await (controller as any).upsertTaskState(
+      (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      }),
+      {
+        goal: "Ship the long-lived cockpit flow",
+      },
+    );
+
+    expect(updateStatusCardMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        channel: "telegram",
+        conversationId: "123:topic:456",
+      }),
+      {
+        provider: "telegram",
+        messageId: "99",
+        chatId: "123",
+      },
+      expect.objectContaining({
+        text: expect.stringContaining("Goal: Ship the long-lived cockpit flow"),
+      }),
+    );
+  });
+
+  it("resumes a task from the status card without overwriting the existing goal", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      taskState: {
+        goal: "Ship the long-lived cockpit flow",
+        stage: "blocked",
+        nextAction: "Resume from the last checkpoint",
+        blocker: "Codex stopped before completion",
+        checkpoint: {
+          summary: "Turn interrupted before completion",
+          nextAction: "Restart or steer the task",
+          savedAt: Date.now(),
+        },
+        updatedAt: Date.now(),
+      },
+      updatedAt: Date.now(),
+    });
+    const callback = await (controller as any).store.putCallback({
+      kind: "resume-task",
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      },
+    });
+    const startTurn = vi.fn(() => ({
+      result: new Promise(() => {}),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => true),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    }));
+    (controller as any).client.startTurn = startTurn;
+    const editMessage = vi.fn(async (_payload: any) => {});
+
+    await controller.handleTelegramInteractive({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123:topic:456",
+      parentConversationId: "123",
+      threadId: 456,
+      callback: {
+        payload: callback.token,
+      },
+      respond: {
+        clearButtons: vi.fn(async () => {}),
+        reply: vi.fn(async () => {}),
+        editMessage,
+      },
+    } as any);
+
+    expect(startTurn).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: expect.stringContaining("Resume the current Codex task from the existing long-lived thread context."),
+    }));
+    expect(startTurn).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: expect.stringContaining("Goal: Ship the long-lived cockpit flow"),
+    }));
+    const binding = (controller as any).store.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123:topic:456",
+      parentConversationId: "123",
+    });
+    expect(binding?.taskState?.goal).toBe("Ship the long-lived cockpit flow");
+    expect(binding?.taskState?.stage).toBe("executing");
+    expect(editMessage).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining("Resuming Codex from the latest checkpoint."),
+    }));
+  });
+
+  it("marks a task verified from the status card", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      taskState: {
+        goal: "Ship the long-lived cockpit flow",
+        stage: "verifying",
+        nextAction: "Review the latest Codex result",
+        latestEvidence: "Controller tests passed for the pinned refresh path.",
+        verification: {
+          status: "unverified",
+          updatedAt: Date.now(),
+        },
+        updatedAt: Date.now(),
+      },
+      updatedAt: Date.now(),
+    });
+    const callback = await (controller as any).store.putCallback({
+      kind: "mark-verified",
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      },
+    });
+    const editMessage = vi.fn(async (_payload: any) => {});
+
+    await controller.handleTelegramInteractive({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123:topic:456",
+      parentConversationId: "123",
+      threadId: 456,
+      callback: {
+        payload: callback.token,
+      },
+      respond: {
+        clearButtons: vi.fn(async () => {}),
+        reply: vi.fn(async () => {}),
+        editMessage,
+      },
+    } as any);
+
+    const binding = (controller as any).store.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123:topic:456",
+      parentConversationId: "123",
+    });
+    expect(binding?.taskState?.stage).toBe("done");
+    expect(binding?.taskState?.verification?.status).toBe("verified");
+    expect(binding?.taskState?.verification?.summary).toBe("Controller tests passed for the pinned refresh path.");
+    expect(editMessage).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining("Marked this task as verified."),
+    }));
+  });
+
+  it("clears the current blocker from the status card", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      taskState: {
+        goal: "Ship the long-lived cockpit flow",
+        stage: "blocked",
+        nextAction: "Restart or steer the task",
+        blocker: "Codex stopped before completion",
+        checkpoint: {
+          summary: "Turn interrupted before completion",
+          nextAction: "Restart or steer the task",
+          savedAt: Date.now(),
+        },
+        updatedAt: Date.now(),
+      },
+      updatedAt: Date.now(),
+    });
+    const callback = await (controller as any).store.putCallback({
+      kind: "clear-task-blocker",
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123:topic:456",
+        parentConversationId: "123",
+      },
+    });
+    const editMessage = vi.fn(async (_payload: any) => {});
+
+    await controller.handleTelegramInteractive({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123:topic:456",
+      parentConversationId: "123",
+      threadId: 456,
+      callback: {
+        payload: callback.token,
+      },
+      respond: {
+        clearButtons: vi.fn(async () => {}),
+        reply: vi.fn(async () => {}),
+        editMessage,
+      },
+    } as any);
+
+    const binding = (controller as any).store.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123:topic:456",
+      parentConversationId: "123",
+    });
+    expect(binding?.taskState?.blocker).toBeUndefined();
+    expect(binding?.taskState?.checkpoint).toBeUndefined();
+    expect(binding?.taskState?.stage).toBe("executing");
+    expect(editMessage).toHaveBeenCalledWith(expect.objectContaining({
+      text: expect.stringContaining("Cleared the current blocker."),
+    }));
+  });
+
+  it("marks verification stale when a verified task receives file edits in a new run", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      taskState: {
+        stage: "verifying",
+        verification: {
+          status: "verified",
+          summary: "Baseline checks passed",
+          updatedAt: Date.now() - 60_000,
+        },
+        updatedAt: Date.now() - 60_000,
+      },
+      updatedAt: Date.now() - 60_000,
+    });
+
+    (controller as any).client.startTurn = vi.fn((params: any) => {
+      void Promise.resolve().then(() => params.onFileEdits?.("Edited files: src/controller.ts"));
+      return {
+        result: Promise.resolve({
+          threadId: "thread-1",
+          text: "done",
+        }),
+        getThreadId: () => "thread-1",
+        queueMessage: vi.fn(async () => false),
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      };
+    });
+
+    await (controller as any).startTurn({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      binding: (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      }),
+      workspaceDir: "/repo/openclaw",
+      prompt: "Ship the cockpit diff",
+      reason: "command",
+    });
+
+    await vi.waitFor(() => {
+      const binding = (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      });
+      expect(binding?.taskState?.verification?.status).toBe("stale");
+      expect(binding?.taskState?.latestEvidence).toBe("Edited files: src/controller.ts");
+    });
+  });
+
+  it("auto-seeds the current task card from a natural top-level prompt", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+
+    (controller as any).client.startTurn = vi.fn(() => ({
+      result: Promise.resolve({
+        threadId: "thread-1",
+        text: "Implemented the status card changes.",
+      }),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => false),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    }));
+
+    await (controller as any).startTurn({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      binding: (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      }),
+      workspaceDir: "/repo/openclaw",
+      prompt: "Fix the cockpit status rendering for long-lived chipcdx flow threads",
+      reason: "command",
+    });
+
+    await vi.waitFor(() => {
+      const binding = (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      });
+      expect(binding?.taskState?.goal).toContain("Fix the cockpit status rendering");
+      expect(binding?.taskState?.stage).toBe("verifying");
+      expect(binding?.taskState?.nextAction).toBe("Review the latest Codex result");
+      expect(binding?.taskState?.verification?.status).toBe("unverified");
+      expect(binding?.taskState?.latestEvidence).toContain("Implemented the status card changes.");
+    });
+  });
+
+  it("injects task resume context for short inbound follow-ups and preserves the task card checkpoint", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      taskState: {
+        goal: "Ship the long-lived cockpit flow",
+        stage: "verifying",
+        nextAction: "Run the prod smoke checks",
+        latestEvidence: "Vitest green for task card and checkpoint flows",
+        checkpoint: {
+          summary: "Tests passed locally",
+          nextAction: "Run the prod smoke checks",
+          savedAt: Date.now(),
+        },
+        verification: {
+          status: "unverified",
+          updatedAt: Date.now(),
+        },
+        updatedAt: Date.now(),
+      },
+      updatedAt: Date.now(),
+    });
+
+    const startTurn = vi.fn(() => ({
+      result: new Promise(() => {}),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => false),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    }));
+    (controller as any).client.startTurn = startTurn;
+
+    await (controller as any).startTurn({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      binding: (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      }),
+      workspaceDir: "/repo/openclaw",
+      prompt: "продолжай",
+      reason: "inbound",
+    });
+
+    expect(startTurn).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: expect.stringContaining("Resume the current Codex task from the existing long-lived thread context."),
+    }));
+    expect(startTurn).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: expect.stringContaining("Goal: Ship the long-lived cockpit flow"),
+    }));
+    expect(startTurn).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: expect.stringContaining("Checkpoint: Tests passed locally"),
+    }));
+    expect(startTurn).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: expect.stringContaining("Latest evidence: Vitest green for task card and checkpoint flows"),
+    }));
+    expect(startTurn).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: expect.stringContaining("Latest user follow-up: продолжай"),
+    }));
+
+    const binding = (controller as any).store.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123",
+    });
+    expect(binding?.taskState?.goal).toBe("Ship the long-lived cockpit flow");
+    expect(binding?.taskState?.stage).toBe("executing");
+    expect(binding?.taskState?.nextAction).toBe("Wait for Codex output");
+    expect(binding?.taskState?.latestEvidence).toBe("Vitest green for task card and checkpoint flows");
+    expect(binding?.taskState?.checkpoint?.summary).toBe("Tests passed locally");
+  });
+
+  it("keeps self-contained inbound prompts raw instead of wrapping them with resume context", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      taskState: {
+        goal: "Ship the long-lived cockpit flow",
+        stage: "executing",
+        nextAction: "Review the latest Codex result",
+        latestEvidence: "Vitest green for task card and checkpoint flows",
+        updatedAt: Date.now(),
+      },
+      updatedAt: Date.now(),
+    });
+
+    const startTurn = vi.fn(() => ({
+      result: new Promise(() => {}),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => false),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    }));
+    (controller as any).client.startTurn = startTurn;
+
+    const detailedPrompt = "Patch src/controller.ts to update the pause label and add a vitest regression for callback expiry.";
+    await (controller as any).startTurn({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      binding: (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      }),
+      workspaceDir: "/repo/openclaw",
+      prompt: detailedPrompt,
+      reason: "inbound",
+    });
+
+    expect(startTurn).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: detailedPrompt,
+    }));
+  });
+
+  it("auto-updates the task card from plan mode without manual task commands", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+
+    (controller as any).client.startTurn = vi.fn(() => ({
+      result: Promise.resolve({
+        threadId: "thread-1",
+        planArtifact: {
+          explanation: "Break the work into a small prod-safe slice.",
+          steps: [
+            { step: "Patch status rendering", status: "completed" },
+            { step: "Run host-side tests", status: "inProgress" },
+          ],
+          markdown: "# Plan",
+        },
+      }),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => false),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    }));
+
+    await (controller as any).startPlan({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      binding: (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      }),
+      workspaceDir: "/repo/openclaw",
+      prompt: "Plan the next prod-safe cockpit improvement",
+      announceStart: false,
+    });
+
+    await vi.waitFor(() => {
+      const binding = (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      });
+      expect(binding?.taskState?.goal).toContain("Plan the next prod-safe cockpit improvement");
+      expect(binding?.taskState?.stage).toBe("planned");
+      expect(binding?.taskState?.latestEvidence).toBe("Break the work into a small prod-safe slice.");
+      expect(binding?.taskState?.nextAction).toBe("Run host-side tests");
+    });
+  });
+
+  it("captures pending questionnaire state as a blocker and checkpoint", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+
+    let resolveResult: ((value: unknown) => void) | undefined;
+    const result = new Promise((resolve) => {
+      resolveResult = resolve;
+    });
+    (controller as any).client.startTurn = vi.fn((params: any) => {
+      void Promise.resolve().then(() =>
+        params.onPendingInput?.({
+          requestId: "req-1",
+          options: [],
+          expiresAt: Date.now() + 60_000,
+          method: "item/tool/requestUserInput",
+          questionnaire: {
+            currentIndex: 0,
+            questions: [
+              {
+                index: 0,
+                id: "scope",
+                header: "Scope",
+                prompt: "Which path should Codex take?",
+                options: [
+                  { key: "A", label: "Safe", description: "Small prod-safe slice." },
+                ],
+                guidance: [],
+                allowFreeform: true,
+              },
+            ],
+            answers: [null],
+            responseMode: "structured",
+          },
+        }),
+      );
+      return {
+        result,
+        getThreadId: () => "thread-1",
+        queueMessage: vi.fn(async () => false),
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => true,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      };
+    });
+
+    await (controller as any).startTurn({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      binding: (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      }),
+      workspaceDir: "/repo/openclaw",
+      prompt: "Continue the chipcdx production task",
+      reason: "command",
+    });
+
+    await vi.waitFor(() => {
+      const binding = (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      });
+      expect(binding?.taskState?.stage).toBe("clarifying");
+      expect(binding?.taskState?.nextAction).toBe("Answer the current Codex questionnaire");
+      expect(binding?.taskState?.blocker).toBe("Codex is waiting for questionnaire answers");
+      expect(binding?.taskState?.checkpoint?.summary).toBe("Codex asked a questionnaire");
+      expect(binding?.taskState?.checkpoint?.nextAction).toBe("Answer the current Codex questionnaire");
+    });
+
+    resolveResult?.({
+      threadId: "thread-1",
+      aborted: true,
+      terminalStatus: "interrupted",
+    });
+  });
+
+  it("clears pending questionnaire blockers once the turn resumes", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+
+    let resolveResult: ((value: unknown) => void) | undefined;
+    const result = new Promise((resolve) => {
+      resolveResult = resolve;
+    });
+    (controller as any).client.startTurn = vi.fn((params: any) => {
+      void Promise.resolve()
+        .then(() =>
+          params.onPendingInput?.({
+            requestId: "req-1",
+            options: [],
+            expiresAt: Date.now() + 60_000,
+            method: "item/tool/requestUserInput",
+            questionnaire: {
+              currentIndex: 0,
+              questions: [
+                {
+                  index: 0,
+                  id: "scope",
+                  header: "Scope",
+                  prompt: "Which path should Codex take?",
+                  options: [{ key: "A", label: "Safe", description: "Small prod-safe slice." }],
+                  guidance: [],
+                  allowFreeform: true,
+                },
+              ],
+              answers: [null],
+              responseMode: "structured",
+            },
+          }),
+        )
+        .then(() => params.onPendingInput?.(null));
+      return {
+        result,
+        getThreadId: () => "thread-1",
+        queueMessage: vi.fn(async () => false),
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      };
+    });
+
+    await (controller as any).startTurn({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      binding: (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      }),
+      workspaceDir: "/repo/openclaw",
+      prompt: "Continue the chipcdx production task",
+      reason: "command",
+    });
+
+    await vi.waitFor(() => {
+      const binding = (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      });
+      expect(binding?.taskState?.stage).toBe("executing");
+      expect(binding?.taskState?.nextAction).toBe("Wait for Codex to finish the current turn");
+      expect(binding?.taskState?.blocker).toBeUndefined();
+      expect(binding?.taskState?.checkpoint).toBeUndefined();
+    });
+
+    resolveResult?.({
+      threadId: "thread-1",
+      aborted: true,
+      terminalStatus: "interrupted",
+    });
+  });
+
+  it("clears pending plan blockers once plan mode resumes", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+
+    let resolveResult: ((value: unknown) => void) | undefined;
+    const result = new Promise((resolve) => {
+      resolveResult = resolve;
+    });
+    (controller as any).client.startTurn = vi.fn((params: any) => {
+      void Promise.resolve()
+        .then(() =>
+          params.onPendingInput?.({
+            requestId: "req-1",
+            options: [],
+            expiresAt: Date.now() + 60_000,
+            method: "item/tool/requestUserInput",
+            questionnaire: {
+              currentIndex: 0,
+              questions: [
+                {
+                  index: 0,
+                  id: "scope",
+                  header: "Scope",
+                  prompt: "Which path should Codex take?",
+                  options: [{ key: "A", label: "Safe", description: "Small prod-safe slice." }],
+                  guidance: [],
+                  allowFreeform: true,
+                },
+              ],
+              answers: [null],
+              responseMode: "structured",
+            },
+          }),
+        )
+        .then(() => params.onPendingInput?.(null));
+      return {
+        result,
+        getThreadId: () => "thread-1",
+        queueMessage: vi.fn(async () => false),
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      };
+    });
+
+    await (controller as any).startPlan({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      workspaceDir: "/repo/openclaw",
+      prompt: "Plan the next prod-safe cockpit improvement",
+      binding: (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      }),
+      reason: "command",
+    });
+
+    await vi.waitFor(() => {
+      const binding = (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      });
+      expect(binding?.taskState?.stage).toBe("planned");
+      expect(binding?.taskState?.nextAction).toBe("Wait for Codex to finish the current plan");
+      expect(binding?.taskState?.blocker).toBeUndefined();
+      expect(binding?.taskState?.checkpoint).toBeUndefined();
+    });
+
+    resolveResult?.({
+      threadId: "thread-1",
+      aborted: true,
+      terminalStatus: "interrupted",
+    });
+  });
+
+  it("captures approval pauses as a resumable checkpoint", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+
+    (controller as any).client.startTurn = vi.fn(() => ({
+      result: Promise.resolve({
+        threadId: "thread-1",
+        stoppedReason: "approval",
+      }),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => false),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    }));
+
+    await (controller as any).startTurn({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      binding: (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      }),
+      workspaceDir: "/repo/openclaw",
+      prompt: "Continue the chipcdx production task",
+      reason: "command",
+    });
+
+    await vi.waitFor(() => {
+      const binding = (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      });
+      expect(binding?.taskState?.stage).toBe("clarifying");
+      expect(binding?.taskState?.nextAction).toBe("Review or approve the pending Codex action");
+      expect(binding?.taskState?.blocker).toBe("Codex paused for approval");
+      expect(binding?.taskState?.checkpoint?.summary).toBe("Codex paused for approval");
+      expect(binding?.taskState?.checkpoint?.nextAction).toBe("Review or approve the pending Codex action");
+    });
+  });
+
+  it("captures interrupted turns as blocked checkpoints", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+
+    (controller as any).client.startTurn = vi.fn((params: any) => {
+      void Promise.resolve().then(() => params.onInterrupted?.());
+      return {
+        result: Promise.resolve({
+          threadId: "thread-1",
+          aborted: true,
+          terminalStatus: "interrupted",
+        }),
+        getThreadId: () => "thread-1",
+        queueMessage: vi.fn(async () => false),
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      };
+    });
+
+    await (controller as any).startTurn({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      binding: (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      }),
+      workspaceDir: "/repo/openclaw",
+      prompt: "Continue the chipcdx production task",
+      reason: "command",
+    });
+
+    await vi.waitFor(() => {
+      const binding = (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      });
+      expect(binding?.taskState?.stage).toBe("blocked");
+      expect(binding?.taskState?.nextAction).toBe("Restart or steer the task");
+      expect(binding?.taskState?.blocker).toBe("Codex stopped before completion");
+      expect(binding?.taskState?.checkpoint?.summary).toBe("Turn interrupted before completion");
+      expect(binding?.taskState?.checkpoint?.nextAction).toBe("Restart or steer the task");
+    });
+  });
+
+  it("orphans active turns on controller stop instead of interrupting them", async () => {
+    const { controller, clientMock } = await createRecoveryHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+
+    let rejectTurn: ((error?: unknown) => void) | undefined;
+    const interrupt = vi.fn(async () => {});
+    const result = new Promise<never>((_resolve, reject) => {
+      rejectTurn = reject;
+    });
+    (clientMock.readThreadContext as any) = vi.fn(async () => ({
+      lastUserMessage: undefined,
+      lastAssistantMessage: "Old assistant reply",
+    }));
+    clientMock.startTurn = vi.fn(() => ({
+      result,
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => false),
+      interrupt,
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    }));
+    clientMock.close = vi.fn(async () => {
+      rejectTurn?.(new Error("codex app server stdio closed"));
+    });
+
+    await (controller as any).startTurn({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      binding: (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      }),
+      workspaceDir: "/repo/openclaw",
+      prompt: "Continue the chipcdx production task",
+      reason: "command",
+    });
+
+    await vi.waitFor(() => {
+      const binding = (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      });
+      expect(binding?.activeTurn).toEqual(
+        expect.objectContaining({
+          status: "running",
+          prompt: "Continue the chipcdx production task",
+        }),
+      );
+    });
+
+    await controller.stop();
+
+    const binding = (controller as any).store.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123",
+    });
+    expect(interrupt).not.toHaveBeenCalled();
+    expect(binding?.activeTurn).toEqual(
+      expect.objectContaining({
+        status: "orphaned",
+        threadId: "thread-1",
+        baselineAssistantMessage: "Old assistant reply",
+      }),
+    );
+    expect(binding?.taskState?.blocker).toBe("Gateway restarted while Codex was still working");
+  });
+
+  it("replays recovered assistant output for orphaned turns after restart", async () => {
+    const stateDir = makeStateDir();
+    const first = await createRecoveryHarness(stateDir);
+    await (first.controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+
+    let rejectTurn: ((error?: unknown) => void) | undefined;
+    const result = new Promise<never>((_resolve, reject) => {
+      rejectTurn = reject;
+    });
+    (first.clientMock.readThreadContext as any) = vi.fn(async () => ({
+      lastUserMessage: undefined,
+      lastAssistantMessage: "Old assistant reply",
+    }));
+    first.clientMock.startTurn = vi.fn(() => ({
+      result,
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => false),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    }));
+    first.clientMock.close = vi.fn(async () => {
+      rejectTurn?.(new Error("codex app server stdio closed"));
+    });
+
+    await (first.controller as any).startTurn({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      binding: (first.controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      }),
+      workspaceDir: "/repo/openclaw",
+      prompt: "Continue the chipcdx production task",
+      reason: "command",
+    });
+    await vi.waitFor(() => {
+      const binding = (first.controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      });
+      expect(binding?.activeTurn?.status).toBe("running");
+    });
+    await first.controller.stop();
+    await vi.waitFor(() => {
+      const binding = (first.controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      });
+      expect(binding?.activeTurn?.status).toBe("orphaned");
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    const second = await createRecoveryHarness(stateDir, { autoStart: false });
+    (second.clientMock.readThreadContext as any) = vi.fn(async () => ({
+      lastUserMessage: undefined,
+      lastAssistantMessage: "Recovered final Codex output",
+    }));
+
+    await second.controller.start();
+
+    await vi.waitFor(() => {
+      expect(
+        second.sendMessageTelegram.mock.calls.some(([, text]) =>
+          String(text).includes("Recovered final Codex output"),
+        ),
+      ).toBe(true);
+    });
+    expect(second.clientMock.startTurn).not.toHaveBeenCalled();
+    const binding = (second.controller as any).store.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123",
+    });
+    expect(binding?.activeTurn).toBeUndefined();
+    expect(binding?.taskState?.nextAction).toBe("Review the recovered Codex result");
+  });
+
+  it("automatically resumes orphaned turns on startup when no recovered reply is available", async () => {
+    const stateDir = makeStateDir();
+    const first = await createRecoveryHarness(stateDir);
+    await (first.controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+
+    let rejectTurn: ((error?: unknown) => void) | undefined;
+    const result = new Promise<never>((_resolve, reject) => {
+      rejectTurn = reject;
+    });
+    (first.clientMock.readThreadContext as any) = vi.fn(async () => ({
+      lastUserMessage: undefined,
+      lastAssistantMessage: "Old assistant reply",
+    }));
+    first.clientMock.startTurn = vi.fn(() => ({
+      result,
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => false),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    }));
+    first.clientMock.close = vi.fn(async () => {
+      rejectTurn?.(new Error("codex app server stdio closed"));
+    });
+
+    await (first.controller as any).startTurn({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      binding: (first.controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      }),
+      workspaceDir: "/repo/openclaw",
+      prompt: "Continue the chipcdx production task",
+      reason: "command",
+    });
+    await vi.waitFor(() => {
+      const binding = (first.controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      });
+      expect(binding?.activeTurn?.status).toBe("running");
+    });
+    await first.controller.stop();
+    await vi.waitFor(() => {
+      const binding = (first.controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      });
+      expect(binding?.activeTurn?.status).toBe("orphaned");
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    const second = await createRecoveryHarness(stateDir, { autoStart: false });
+    (second.clientMock.readThreadContext as any) = vi.fn(async () => ({
+      lastUserMessage: undefined,
+      lastAssistantMessage: "Old assistant reply",
+    }));
+    second.clientMock.startTurn = vi.fn(() => ({
+      result: Promise.resolve({
+        threadId: "thread-1",
+        text: "Resumed Codex output",
+      }),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => false),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    }));
+
+    await second.controller.start();
+
+    await vi.waitFor(() => {
+      expect(second.clientMock.startTurn).toHaveBeenCalledTimes(1);
+    });
+    expect(second.clientMock.startTurn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        existingThreadId: "thread-1",
+        prompt: expect.stringContaining("cockpit gateway restarted"),
+      }),
+    );
+    expect(
+      second.sendMessageTelegram.mock.calls.some(([, text]) =>
+        String(text).includes("Resuming the task on the same thread"),
+      ),
+    ).toBe(true);
   });
 });

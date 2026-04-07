@@ -52,6 +52,7 @@ import {
 import { formatCommandUsage, renderCommandHelpText } from "./help.js";
 import type {
   AccountSummary,
+  ActiveTurnRecoveryState,
   CollaborationMode,
   CodexTurnInputItem,
   ConversationPreferences,
@@ -105,15 +106,8 @@ type ActiveRunRecord = {
   workspaceDir: string;
   mode: "default" | "plan" | "review";
   profile: PermissionsMode;
+  runId: string;
   handle: ActiveCodexRun;
-};
-
-type QueuedInboundClaim = {
-  content: string;
-  channel: string;
-  conversation: ConversationTarget;
-  accountId?: string;
-  media?: PluginInboundMedia[];
 };
 
 const execFileAsync = promisify(execFile);
@@ -1107,6 +1101,7 @@ function buildPendingPermissionsMigrationNote(profile: PermissionsMode): string 
 
 const TURN_PROGRESS_DELAY_MS = 12_000;
 const TURN_PROGRESS_INTERVAL_MS = 120_000;
+const ORPHANED_TURN_RECOVERY_MAX_ATTEMPTS = 2;
 const PLAN_PROGRESS_DELAY_MS = 12_000;
 const REVIEW_PROGRESS_DELAY_MS = 12_000;
 const COMPACT_PROGRESS_DELAY_MS = 12_000;
@@ -1354,15 +1349,47 @@ function normalizeTaskText(value: string | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
+function normalizeTaskPrompt(prompt: string): string {
+  return prompt.replace(/\s+/g, " ").trim();
+}
+
+function isGenericTaskContinuationPrompt(prompt: string): boolean {
+  const normalized = normalizeTaskPrompt(prompt).toLowerCase();
+  if (!normalized || normalized.length > 80 || /[\n`]/.test(prompt)) {
+    return false;
+  }
+  return /^(?:continue|resume|keep going|go on|go ahead|carry on|proceed|do it|ship it|implement the plan|ok(?:ay)?|sure|yes|yep|да|ага|угу|ок(?:ей)?|хорошо|поехали|погнали|давай|давай дальше|делай|делай дальше|продолжай|продолжи|дальше|возобнови)(?:[.!?,…]+)?$/i.test(normalized);
+}
+
+function looksLikeSelfContainedTaskPrompt(prompt: string): boolean {
+  const normalized = normalizeTaskPrompt(prompt);
+  if (!normalized) {
+    return false;
+  }
+  if (normalized.startsWith("/")) {
+    return true;
+  }
+  if (normalized.length > 80 || /[\n`]/.test(prompt)) {
+    return true;
+  }
+  return /(?:^|\s)(?:src\/|tests?\/|\.[cm]?[jt]sx?\b|pnpm\b|npm\b|yarn\b|vitest\b|tsc\b|build\b|typecheck\b|diff\b|patch\b)/i.test(normalized);
+}
+
 function deriveTaskGoalFromPrompt(prompt: string): string | undefined {
-  const normalized = prompt.replace(/\s+/g, " ").trim();
+  const normalized = normalizeTaskPrompt(prompt);
   if (!normalized) {
     return undefined;
   }
   if (normalized.startsWith("/")) {
     return undefined;
   }
+  if (isGenericTaskContinuationPrompt(normalized)) {
+    return undefined;
+  }
   if (/^implement the plan\.?$/i.test(normalized)) {
+    return undefined;
+  }
+  if (/^resume the current codex task\b/i.test(normalized)) {
     return undefined;
   }
   return summarizeTextForLog(normalized, 140);
@@ -1478,6 +1505,119 @@ function buildTaskCheckpoint(summary: string, nextAction?: string): TaskCheckpoi
     ...(normalizedNextAction ? { nextAction: normalizedNextAction } : {}),
     savedAt: Date.now(),
   };
+}
+
+function isInlineBlockerCheckpoint(summary: string | undefined): boolean {
+  const normalized = summary?.trim();
+  return normalized === "Codex asked a questionnaire" ||
+    normalized === "Codex paused for input" ||
+    normalized === "Codex paused for approval" ||
+    normalized === "Turn interrupted before completion" ||
+    normalized === "Codex planning was interrupted" ||
+    normalized === "Codex failed before completion";
+}
+
+function buildResumeTaskPrompt(taskState: TaskCardState | undefined): string {
+  const lines = ["Resume the current Codex task from the existing long-lived thread context."];
+  if (taskState?.goal?.trim()) {
+    lines.push(`Goal: ${taskState.goal.trim()}`);
+  }
+  if (taskState?.checkpoint?.summary?.trim()) {
+    lines.push(`Checkpoint: ${taskState.checkpoint.summary.trim()}`);
+  }
+  if (taskState?.checkpoint?.nextAction?.trim()) {
+    lines.push(`Checkpoint next action: ${taskState.checkpoint.nextAction.trim()}`);
+  }
+  if (taskState?.latestEvidence?.trim()) {
+    lines.push(`Latest evidence: ${taskState.latestEvidence.trim()}`);
+  }
+  if (taskState?.blocker?.trim()) {
+    lines.push(`Recent blocker: ${taskState.blocker.trim()}`);
+  }
+  if (taskState?.nextAction?.trim()) {
+    lines.push(`Current next action: ${taskState.nextAction.trim()}`);
+  }
+  lines.push("Continue from the current state without restating completed work. Make concrete progress and report what changed.");
+  return lines.join("\n");
+}
+
+function shouldInjectTaskResumeContext(params: {
+  taskState: TaskCardState | undefined;
+  prompt: string;
+  reason: "command" | "inbound" | "plan";
+}): boolean {
+  if (params.reason !== "inbound") {
+    return false;
+  }
+  if (!hasTaskStateContent(params.taskState) || params.taskState?.stage === "done") {
+    return false;
+  }
+  if (isGenericTaskContinuationPrompt(params.prompt)) {
+    return true;
+  }
+  return !looksLikeSelfContainedTaskPrompt(params.prompt);
+}
+
+function buildTaskContinuationPrompt(taskState: TaskCardState | undefined, prompt: string): string {
+  const normalizedFollowUp = normalizeTaskPrompt(prompt) || prompt.trim();
+  const lines = [buildResumeTaskPrompt(taskState)];
+  if (normalizedFollowUp) {
+    lines.push(`Latest user follow-up: ${normalizedFollowUp}`);
+  }
+  lines.push(
+    "Treat the latest user follow-up as the newest instruction. If it changes priorities, follow it; otherwise continue the current task.",
+  );
+  return lines.join("\n");
+}
+
+function buildGatewayRestartRecoveryPrompt(taskState: TaskCardState | undefined, prompt: string): string {
+  const normalizedPrompt = normalizeTaskPrompt(prompt) || prompt.trim();
+  const lines = [
+    buildResumeTaskPrompt(taskState),
+    "The previous Codex turn was cut off because the cockpit gateway restarted while it was still running.",
+    "Resume on the same thread. Do not repeat completed work or resend unchanged summaries.",
+  ];
+  if (normalizedPrompt) {
+    lines.push(`Original task prompt: ${normalizedPrompt}`);
+  }
+  lines.push("If the task already finished in the thread, send only the missing final answer.");
+  return lines.join("\n");
+}
+
+function getTaskCardReadyStage(taskState: TaskCardState | undefined, activeMode?: "default" | "plan"): TaskStage {
+  if (activeMode === "plan") {
+    return "planned";
+  }
+  if (activeMode === "default") {
+    return "executing";
+  }
+  if (taskState?.stage === "planned") {
+    return "planned";
+  }
+  if (taskState?.stage === "verifying") {
+    return "verifying";
+  }
+  if (taskState?.latestEvidence?.trim()) {
+    return "verifying";
+  }
+  if (taskState?.goal?.trim()) {
+    return "executing";
+  }
+  return "intake";
+}
+
+function getTaskCardReadyNextAction(taskState: TaskCardState | undefined, activeMode?: "default" | "plan"): string {
+  if (activeMode === "plan") {
+    return "Wait for Codex to finish the current plan";
+  }
+  if (activeMode === "default") {
+    return "Wait for Codex to finish the current turn";
+  }
+  return taskState?.checkpoint?.nextAction?.trim() ||
+    taskState?.nextAction?.trim() ||
+    (taskState?.latestEvidence?.trim()
+      ? "Review the latest Codex result"
+      : "Send the next task message in this thread");
 }
 
 function mergeTaskState(
@@ -1732,7 +1872,7 @@ export class CodexPluginController {
   private readonly settings;
   private readonly client;
   private readonly activeRuns = new Map<string, ActiveRunRecord>();
-  private readonly queuedInboundClaims = new Map<string, QueuedInboundClaim[]>();
+  private readonly shutdownOrphanedRunKeys = new Set<string>();
   private readonly threadChangesCache = new Map<string, Promise<boolean | undefined>>();
   private readonly processedAudioHookMessages = new Map<string, number>();
   private readonly store;
@@ -1763,17 +1903,34 @@ export class CodexPluginController {
     if (this.started) {
       return;
     }
+    this.shutdownOrphanedRunKeys.clear();
     await this.store.load();
     await this.client.logStartupProbe().catch(() => undefined);
     this.started = true;
+    await this.recoverOrphanedTurns().catch((error) => {
+      this.api.logger.warn(`codex orphaned turn recovery failed: ${String(error)}`);
+    });
   }
 
   async stop(): Promise<void> {
     if (!this.started) {
       return;
     }
-    for (const active of this.activeRuns.values()) {
-      await active.handle.interrupt().catch(() => undefined);
+    for (const [key, active] of this.activeRuns.entries()) {
+      if (active.mode === "review") {
+        await active.handle.interrupt().catch(() => undefined);
+        continue;
+      }
+      this.shutdownOrphanedRunKeys.add(key);
+      const binding = this.store.getBinding(active.conversation);
+      if (!binding) {
+        continue;
+      }
+      await this.markActiveTurnOrphaned(binding, active.handle.getThreadId()).catch((error) => {
+        this.api.logger.warn(
+          `codex active turn orphaning failed ${this.formatConversationForLog(active.conversation)}: ${String(error)}`,
+        );
+      });
     }
     this.activeRuns.clear();
     await this.client.close().catch(() => undefined);
@@ -1834,6 +1991,108 @@ export class CodexPluginController {
     }
   }
 
+  private isPermanentMissingThreadError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    const normalized = message.trim().toLowerCase();
+    return (
+      normalized.includes("no rollout found for thread id") ||
+      normalized.includes("thread not found") ||
+      normalized.includes("no thread found") ||
+      normalized.includes("unknown thread id")
+    );
+  }
+
+  private formatMissingBoundThreadMessage(binding: StoredBinding): string {
+    return [
+      `The bound Codex thread \`${binding.threadId}\` is no longer available.`,
+      "I kept the cockpit task state, but I did not send this message to Codex.",
+      "Use `/cas_resume --new` to start a fresh thread or `/cas_resume <thread-id>` to bind another thread.",
+    ].join("\n\n");
+  }
+
+  private async markBindingThreadMissing(binding: StoredBinding): Promise<StoredBinding> {
+    const nextBinding: StoredBinding = {
+      ...binding,
+      taskState: mergeTaskState(binding.taskState, {
+        stage: "blocked",
+        blocker: "Bound Codex thread is no longer available",
+        nextAction: "Start a new thread or resume another thread",
+        checkpoint: buildTaskCheckpoint(
+          "The bound Codex thread is missing",
+          "Start a new thread or resume another thread",
+        ),
+        lastHeartbeatAt: Date.now(),
+      }),
+      updatedAt: Date.now(),
+    };
+    await this.store.upsertBinding(nextBinding);
+    return nextBinding;
+  }
+
+  private async refreshBindingFromThreadState(
+    binding: StoredBinding,
+    state: ThreadState | undefined,
+  ): Promise<StoredBinding> {
+    if (
+      !state?.threadName?.trim() &&
+      !state?.cwd?.trim()
+    ) {
+      return binding;
+    }
+    const nextBinding: StoredBinding = {
+      ...binding,
+      threadTitle: state.threadName?.trim() || binding.threadTitle,
+      workspaceDir: state.cwd?.trim() || binding.workspaceDir,
+      updatedAt: Date.now(),
+    };
+    if (
+      nextBinding.threadTitle === binding.threadTitle &&
+      nextBinding.workspaceDir === binding.workspaceDir
+    ) {
+      return binding;
+    }
+    await this.store.upsertBinding(nextBinding);
+    return nextBinding;
+  }
+
+  private async readBoundThreadStateWithRetry(
+    binding: StoredBinding,
+    conversation: ConversationTarget,
+    context: string,
+  ): Promise<ThreadState | undefined | null> {
+    const profile = this.getPermissionsMode(binding);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        return await this.client.readThreadState({
+          profile,
+          sessionKey: binding.sessionKey,
+          threadId: binding.threadId,
+        });
+      } catch (error) {
+        if (this.isPermanentMissingThreadError(error)) {
+          if (attempt === 0) {
+            this.api.logger.warn(
+              `codex ${context} retrying after missing bound thread ${this.formatConversationForLog(conversation)} boundThread=${binding.threadId}: ${String(error)}`,
+            );
+            continue;
+          }
+          this.api.logger.warn(
+            `codex ${context} confirmed missing bound thread ${this.formatConversationForLog(conversation)} boundThread=${binding.threadId}: ${String(error)}`,
+          );
+          return null;
+        }
+        if (isMissingThreadError(error)) {
+          this.api.logger.warn(
+            `codex ${context} could not read bound thread state ${this.formatConversationForLog(conversation)} boundThread=${binding.threadId}: ${String(error)}`,
+          );
+          return undefined;
+        }
+        throw error;
+      }
+    }
+    return undefined;
+  }
+
   private formatConversationForLog(conversation: ConversationTarget): string {
     return [
       `channel=${conversation.channel}`,
@@ -1842,35 +2101,6 @@ export class CodexPluginController {
       `parent=${conversation.parentConversationId ?? "<none>"}`,
       `thread=${conversation.threadId == null ? "<none>" : String(conversation.threadId)}`,
     ].join(" ");
-  }
-
-  private enqueueInboundClaim(key: string, event: QueuedInboundClaim): number {
-    const queue = this.queuedInboundClaims.get(key) ?? [];
-    queue.push(event);
-    this.queuedInboundClaims.set(key, queue);
-    return queue.length;
-  }
-
-  private dequeueInboundClaim(key: string): QueuedInboundClaim | null {
-    const queue = this.queuedInboundClaims.get(key);
-    if (!queue?.length) {
-      return null;
-    }
-    const next = queue.shift() ?? null;
-    if (queue.length) {
-      this.queuedInboundClaims.set(key, queue);
-    } else {
-      this.queuedInboundClaims.delete(key);
-    }
-    return next;
-  }
-
-  private async processQueuedInboundClaim(key: string): Promise<void> {
-    const next = this.dequeueInboundClaim(key);
-    if (!next) {
-      return;
-    }
-    await this.handleInboundClaim(next);
   }
 
   async handleInboundClaim(event: {
@@ -1923,20 +2153,9 @@ export class CodexPluginController {
           if (handled) {
             return { handled: true };
           }
-          const queued = this.enqueueInboundClaim(activeKey, {
-            content: event.content,
-            channel: event.channel,
-            conversation,
-            accountId: event.accountId,
-            media: event.media,
-          });
-          if (queued === 1) {
-            await this.sendText(conversation, "Взял в очередь. Доберу после текущего ответа.");
-          }
-          this.api.logger.info?.(
-            `queued inbound claim behind active run conversation=${conversation.conversationId} queue=${queued}`,
+          this.api.logger.warn(
+            `codex inbound claim could not enqueue message for active run; restarting thread conversation=${conversation.conversationId}`,
           );
-          return { handled: true };
         } catch (error) {
           this.api.logger.warn(
             `codex inbound claim active run enqueue failed; restarting thread conversation=${conversation.conversationId}: ${String(error)}`,
@@ -1964,13 +2183,27 @@ export class CodexPluginController {
           await this.renameConversationIfSupported(conversation, syncedName);
         }
       }
+      const boundThreadState = await this.readBoundThreadStateWithRetry(
+        resolvedBinding,
+        conversation,
+        "inbound claim",
+      );
+      if (boundThreadState === null) {
+        const nextBinding = await this.markBindingThreadMissing(resolvedBinding);
+        await this.sendText(conversation, this.formatMissingBoundThreadMessage(nextBinding));
+        return { handled: true };
+      }
+      const nextBinding =
+        boundThreadState === undefined
+          ? resolvedBinding
+          : await this.refreshBindingFromThreadState(resolvedBinding, boundThreadState);
       this.api.logger.debug?.(
-        `codex inbound claim starting turn ${this.formatConversationForLog(conversation)} workspace=${resolvedBinding.workspaceDir} thread=${resolvedBinding.threadId} prompt="${summarizeTextForLog(event.content)}"`,
+        `codex inbound claim starting turn ${this.formatConversationForLog(conversation)} workspace=${nextBinding.workspaceDir} thread=${nextBinding.threadId} prompt="${summarizeTextForLog(event.content)}"`,
       );
       await this.startTurn({
         conversation,
-        binding: resolvedBinding,
-        workspaceDir: resolvedBinding.workspaceDir,
+        binding: nextBinding,
+        workspaceDir: nextBinding.workspaceDir,
         prompt: event.content,
         input,
         reason: "inbound",
@@ -2833,20 +3066,204 @@ export class CodexPluginController {
     binding: StoredBinding,
     updates: Parameters<typeof mergeTaskState>[1],
   ): Promise<StoredBinding> {
+    const nextHeartbeat =
+      typeof updates.lastHeartbeatAt === "number" ? updates.lastHeartbeatAt : undefined;
     const nextBinding: StoredBinding = {
       ...binding,
+      activeTurn:
+        binding.activeTurn && nextHeartbeat !== undefined
+          ? {
+              ...binding.activeTurn,
+              lastHeartbeatAt: nextHeartbeat,
+            }
+          : binding.activeTurn,
       taskState: mergeTaskState(binding.taskState, updates),
       updatedAt: Date.now(),
     };
-    await this.store.upsertBinding(nextBinding);
-    if (nextBinding.pinnedBindingMessage) {
-      await this.refreshPinnedStatusCard(nextBinding).catch((error) => {
+    return await this.persistBinding(nextBinding);
+  }
+
+  private async persistBinding(binding: StoredBinding): Promise<StoredBinding> {
+    await this.store.upsertBinding(binding);
+    if (binding.pinnedBindingMessage) {
+      await this.refreshPinnedStatusCard(binding).catch((error) => {
         this.api.logger.warn(
-          `codex pinned status refresh failed ${this.formatConversationForLog(nextBinding.conversation)}: ${String(error)}`,
+          `codex pinned status refresh failed ${this.formatConversationForLog(binding.conversation)}: ${String(error)}`,
         );
       });
     }
-    return nextBinding;
+    return binding;
+  }
+
+  private async persistActiveTurnState(
+    binding: StoredBinding | null | undefined,
+    activeTurn: ActiveTurnRecoveryState | null | undefined,
+  ): Promise<StoredBinding | null> {
+    if (!binding) {
+      return null;
+    }
+    const nextBinding: StoredBinding = {
+      ...binding,
+      activeTurn: activeTurn ?? undefined,
+      updatedAt: Date.now(),
+    };
+    return await this.persistBinding(nextBinding);
+  }
+
+  private async captureBaselineAssistantMessage(
+    binding: StoredBinding | null | undefined,
+    profile: PermissionsMode,
+  ): Promise<string | undefined> {
+    const threadId = binding?.threadId?.trim();
+    if (!binding || !threadId) {
+      return undefined;
+    }
+    const replay = await this.client
+      .readThreadContext({
+        profile,
+        sessionKey: binding.sessionKey,
+        threadId,
+      })
+      .catch(() => undefined);
+    return replay?.lastAssistantMessage?.trim() || undefined;
+  }
+
+  private async markActiveTurnRunning(
+    binding: StoredBinding | null | undefined,
+    params: {
+      runId: string;
+      mode: "default" | "plan";
+      workspaceDir: string;
+      prompt: string;
+      reason: "command" | "inbound" | "plan";
+      collaborationMode?: CollaborationMode;
+      profile: PermissionsMode;
+    },
+  ): Promise<StoredBinding | null> {
+    if (!binding) {
+      return null;
+    }
+    const previous = binding.activeTurn;
+    const now = Date.now();
+    const activeTurn: ActiveTurnRecoveryState = {
+      runId: params.runId,
+      mode: params.mode,
+      workspaceDir: params.workspaceDir,
+      prompt: params.prompt,
+      reason: params.reason,
+      collaborationMode: params.collaborationMode,
+      threadId: binding.threadId,
+      baselineAssistantMessage: await this.captureBaselineAssistantMessage(binding, params.profile),
+      startedAt: now,
+      lastHeartbeatAt: now,
+      recoveryAttemptCount:
+        previous?.status === "orphaned" ? (previous.recoveryAttemptCount ?? 0) + 1 : 0,
+      status: "running",
+    };
+    return await this.persistActiveTurnState(binding, activeTurn);
+  }
+
+  private async markActiveTurnOrphaned(
+    binding: StoredBinding | null | undefined,
+    threadId?: string,
+  ): Promise<StoredBinding | null> {
+    if (!binding?.activeTurn) {
+      return binding ?? null;
+    }
+    const nextThreadId = threadId?.trim() || binding.activeTurn.threadId || binding.threadId;
+    const now = Date.now();
+    const nextBinding: StoredBinding = {
+      ...binding,
+      activeTurn: {
+        ...binding.activeTurn,
+        threadId: nextThreadId || undefined,
+        status: "orphaned",
+        lastHeartbeatAt: now,
+      },
+      taskState: mergeTaskState(binding.taskState, {
+        stage: "blocked",
+        blocker: "Gateway restarted while Codex was still working",
+        nextAction: "Wait for cockpit recovery to resume or replay the last turn",
+        checkpoint: buildTaskCheckpoint(
+          "Gateway restarted during an active Codex turn",
+          "Wait for cockpit recovery to resume or replay the last turn",
+        ),
+        lastHeartbeatAt: now,
+      }),
+      updatedAt: now,
+    };
+    return await this.persistBinding(nextBinding);
+  }
+
+  private async clearActiveTurn(binding: StoredBinding | null | undefined): Promise<StoredBinding | null> {
+    return await this.persistActiveTurnState(binding, null);
+  }
+
+  private async recoverOrphanedTurns(): Promise<void> {
+    for (const binding of this.store.listBindings()) {
+      if (binding.activeTurn?.status !== "orphaned") {
+        continue;
+      }
+      await this.recoverOrphanedTurn(binding).catch((error) => {
+        this.api.logger.warn(
+          `codex orphaned turn recovery failed ${this.formatConversationForLog(binding.conversation)}: ${String(error)}`,
+        );
+      });
+    }
+  }
+
+  private async recoverOrphanedTurn(binding: StoredBinding): Promise<void> {
+    const activeTurn = binding.activeTurn;
+    if (!activeTurn || activeTurn.status !== "orphaned") {
+      return;
+    }
+    if ((activeTurn.recoveryAttemptCount ?? 0) >= ORPHANED_TURN_RECOVERY_MAX_ATTEMPTS) {
+      await this.clearActiveTurn(binding);
+      return;
+    }
+    const profile = this.getPermissionsMode(binding);
+    const threadId = activeTurn.threadId?.trim() || binding.threadId?.trim();
+    if (threadId) {
+      const replay = await this.client
+        .readThreadContext({
+          profile,
+          sessionKey: binding.sessionKey,
+          threadId,
+        })
+        .catch(() => undefined);
+      const recoveredAssistant = replay?.lastAssistantMessage?.trim();
+      const baselineAssistant = activeTurn.baselineAssistantMessage?.trim();
+      if (recoveredAssistant && recoveredAssistant !== baselineAssistant) {
+        const recoveredText = this.trimReplayText(recoveredAssistant, 4000) ?? recoveredAssistant;
+        await this.sendText(
+          binding.conversation,
+          `Recovered Codex reply after gateway restart:\n\n${recoveredText}`,
+        );
+        let nextBinding =
+          (await this.upsertTaskState(binding, {
+            stage: "verifying",
+            nextAction: "Review the recovered Codex result",
+            latestEvidence: summarizeTextForLog(recoveredText, 160),
+            blocker: null,
+            checkpoint: null,
+            lastHeartbeatAt: Date.now(),
+          })) ?? binding;
+        nextBinding = (await this.clearActiveTurn(nextBinding)) ?? nextBinding;
+        return;
+      }
+    }
+    await this.sendText(
+      binding.conversation,
+      "Gateway restarted while Codex was still working. Resuming the task on the same thread...",
+    );
+    await this.startTurn({
+      conversation: binding.conversation,
+      binding,
+      workspaceDir: activeTurn.workspaceDir || binding.workspaceDir,
+      prompt: buildGatewayRestartRecoveryPrompt(binding.taskState, activeTurn.prompt),
+      reason: activeTurn.reason,
+      collaborationMode: activeTurn.collaborationMode,
+    });
   }
 
   private async refreshPinnedStatusCard(binding: StoredBinding): Promise<void> {
@@ -2870,6 +3287,32 @@ export class CodexPluginController {
       return null;
     }
     return await this.upsertTaskState(binding, {
+      lastHeartbeatAt: Date.now(),
+    });
+  }
+
+  private async resumeTaskStateAfterPendingInput(
+    binding: StoredBinding | null | undefined,
+    stage: TaskStage,
+    nextAction: string,
+  ): Promise<StoredBinding | null> {
+    if (!binding) {
+      return null;
+    }
+    const blocker = binding.taskState?.blocker?.trim();
+    const checkpoint = binding.taskState?.checkpoint?.summary?.trim();
+    const isPendingBlocker =
+      blocker === "Codex is waiting for questionnaire answers" || blocker === "Codex is waiting for input";
+    const isPendingCheckpoint =
+      checkpoint === "Codex asked a questionnaire" || checkpoint === "Codex paused for input";
+    if (!isPendingBlocker && !isPendingCheckpoint) {
+      return await this.touchTaskHeartbeat(binding);
+    }
+    return await this.upsertTaskState(binding, {
+      stage,
+      nextAction,
+      blocker: null,
+      checkpoint: null,
       lastHeartbeatAt: Date.now(),
     });
   }
@@ -2905,19 +3348,18 @@ export class CodexPluginController {
     prompt: string;
     stage: TaskStage;
     nextAction: string;
+    preserveTaskContext?: boolean;
   }): Promise<StoredBinding | null> {
     if (!params.binding) {
       return null;
     }
     const derivedGoal = deriveTaskGoalFromPrompt(params.prompt);
     const existingVerification = params.binding.taskState?.verification;
-    return await this.upsertTaskState(params.binding, {
+    const updates: Parameters<typeof mergeTaskState>[1] = {
       goal: derivedGoal ?? params.binding.taskState?.goal,
       stage: params.stage,
       nextAction: params.nextAction,
-      latestEvidence: null,
       blocker: null,
-      checkpoint: null,
       verification:
         existingVerification?.status === "verified" || existingVerification?.status === "verified-risk"
           ? {
@@ -2931,7 +3373,12 @@ export class CodexPluginController {
               updatedAt: Date.now(),
             },
       lastHeartbeatAt: Date.now(),
-    });
+    };
+    if (!params.preserveTaskContext) {
+      updates.latestEvidence = null;
+      updates.checkpoint = null;
+    }
+    return await this.upsertTaskState(params.binding, updates);
   }
 
   private async updateAutomaticTaskStateFromPlan(
@@ -3292,6 +3739,22 @@ export class CodexPluginController {
     const currentReasoning = normalizeReasoningEffort(
       effectiveState?.reasoningEffort ?? binding.preferences?.preferredReasoningEffort,
     );
+    const activeRun = this.activeRuns.get(buildConversationKey(conversation));
+    const taskState = binding.taskState;
+    const hasTaskContext = Boolean(
+      taskState?.goal?.trim() ||
+      taskState?.nextAction?.trim() ||
+      taskState?.latestEvidence?.trim() ||
+      taskState?.checkpoint?.summary?.trim() ||
+      taskState?.blocker?.trim(),
+    );
+    const canResumeTask = !activeRun && hasTaskContext && taskState?.stage !== "done";
+    const canMarkVerified = !activeRun &&
+      hasTaskContext &&
+      taskState?.stage !== "done" &&
+      taskState?.verification?.status !== "verified" &&
+      taskState?.verification?.status !== "verified-risk";
+    const canClearBlocker = Boolean(taskState?.blocker?.trim());
     const [showModelPicker, showReasoningPicker, togglePermissions, compactThread, stopRun, refreshStatus, detachThread, showSkills, showMcp] = await Promise.all([
       this.store.putCallback({
         kind: "show-model-picker",
@@ -3363,6 +3826,47 @@ export class CodexPluginController {
         {
           text: "Permissions: toggle",
           callback_data: `${INTERACTIVE_NAMESPACE}:${togglePermissions.token}`,
+        },
+      ]);
+    }
+    const taskButtons: Array<{ text: string; callback_data: string }> = [];
+    if (activeRun) {
+      taskButtons.push({
+        text: "Pause",
+        callback_data: `${INTERACTIVE_NAMESPACE}:${stopRun.token}`,
+      });
+    } else if (canResumeTask) {
+      const resumeTask = await this.store.putCallback({
+        kind: "resume-task",
+        conversation,
+      });
+      taskButtons.push({
+        text: "Resume",
+        callback_data: `${INTERACTIVE_NAMESPACE}:${resumeTask.token}`,
+      });
+    }
+    if (canMarkVerified) {
+      const markVerified = await this.store.putCallback({
+        kind: "mark-verified",
+        conversation,
+      });
+      taskButtons.push({
+        text: "Mark verified",
+        callback_data: `${INTERACTIVE_NAMESPACE}:${markVerified.token}`,
+      });
+    }
+    if (taskButtons.length > 0) {
+      buttons.push(taskButtons);
+    }
+    if (canClearBlocker) {
+      const clearTaskBlocker = await this.store.putCallback({
+        kind: "clear-task-blocker",
+        conversation,
+      });
+      buttons.push([
+        {
+          text: "Clear blocker",
+          callback_data: `${INTERACTIVE_NAMESPACE}:${clearTaskBlocker.token}`,
         },
       ]);
     }
@@ -4294,18 +4798,29 @@ export class CodexPluginController {
   }): Promise<void> {
     const key = buildConversationKey(params.conversation);
     let binding = params.binding;
+    const taskStateBeforeTurn = binding?.taskState;
+    const injectTaskResumeContext = shouldInjectTaskResumeContext({
+      taskState: taskStateBeforeTurn,
+      prompt: params.prompt,
+      reason: params.reason,
+    });
+    const codexPrompt =
+      injectTaskResumeContext && taskStateBeforeTurn
+        ? buildTaskContinuationPrompt(taskStateBeforeTurn, params.prompt)
+        : params.prompt;
     binding =
       (await this.seedAutomaticTaskState({
         binding,
         prompt: params.prompt,
         stage: "executing",
         nextAction: "Wait for Codex output",
+        preserveTaskContext: injectTaskResumeContext,
       })) ?? binding;
     binding = (await this.touchTaskHeartbeat(binding)) ?? binding;
     const profile = this.getPermissionsMode(binding);
     const existing = this.activeRuns.get(key);
     this.api.logger.debug?.(
-      `codex turn request reason=${params.reason} ${this.formatConversationForLog(params.conversation)} workspace=${params.workspaceDir} existing=${existing ? existing.mode : "none"} profile=${profile} prompt="${summarizeTextForLog(params.prompt)}"`,
+      `codex turn request reason=${params.reason} ${this.formatConversationForLog(params.conversation)} workspace=${params.workspaceDir} existing=${existing ? existing.mode : "none"} profile=${profile} prompt="${summarizeTextForLog(codexPrompt)}"`,
     );
     if (existing) {
       if (existing.mode === "plan" && (params.collaborationMode?.mode ?? "default") !== "plan") {
@@ -4316,7 +4831,7 @@ export class CodexPluginController {
         await existing.handle.interrupt().catch(() => undefined);
       } else {
         try {
-          const handled = await existing.handle.queueMessage(params.prompt, params.input);
+          const handled = await existing.handle.queueMessage(codexPrompt, params.input);
           if (handled) {
             this.api.logger.debug?.(
               `codex turn request queued onto active run ${this.formatConversationForLog(params.conversation)} mode=${existing.mode}`,
@@ -4367,13 +4882,24 @@ export class CodexPluginController {
       binding,
       this.settings.defaultModel,
     );
+    const runId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    binding =
+      (await this.markActiveTurnRunning(binding, {
+        runId,
+        mode: params.collaborationMode?.mode === "plan" ? "plan" : "default",
+        workspaceDir: params.workspaceDir,
+        prompt: params.prompt,
+        reason: params.reason,
+        collaborationMode: params.collaborationMode,
+        profile,
+      })) ?? binding;
     const run = this.client.startTurn({
       profile,
       sessionKey: binding?.sessionKey,
       workspaceDir: params.workspaceDir,
-      prompt: params.prompt,
+      prompt: codexPrompt,
       input: params.input,
-      runId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      runId,
       existingThreadId: binding?.threadId,
       model: desired.model,
       reasoningEffort: desired.reasoningEffort,
@@ -4405,6 +4931,13 @@ export class CodexPluginController {
               ),
               lastHeartbeatAt: Date.now(),
             }).catch(() => null)) ?? binding;
+        } else {
+          binding =
+            (await this.resumeTaskStateAfterPendingInput(
+              binding ?? this.store.getBinding(params.conversation),
+              "executing",
+              "Wait for Codex to finish the current turn",
+            ).catch(() => null)) ?? binding;
         }
         await this.handlePendingInputState(params.conversation, params.workspaceDir, state, run);
       },
@@ -4445,10 +4978,17 @@ export class CodexPluginController {
       workspaceDir: params.workspaceDir,
       mode: params.collaborationMode?.mode === "plan" ? "plan" : "default",
       profile,
+      runId,
       handle: run,
     });
     void (run.result as Promise<import("./types.js").TurnResult>)
       .then(async (result) => {
+        if (this.shutdownOrphanedRunKeys.has(key)) {
+          this.api.logger.debug?.(
+            `codex turn completion suppressed during gateway stop ${this.formatConversationForLog(params.conversation)} run=${runId}`,
+          );
+          return;
+        }
         const threadId = result.threadId || run.getThreadId();
         if (threadId) {
           const state = await this.client
@@ -4514,13 +5054,21 @@ export class CodexPluginController {
               completionText,
             })) ?? binding;
         }
+        binding = (await this.clearActiveTurn(binding)) ?? binding;
         await this.sendText(params.conversation, completionText);
       })
       .catch(async (error) => {
+        if (this.shutdownOrphanedRunKeys.has(key)) {
+          this.api.logger.debug?.(
+            `codex turn failure suppressed during gateway stop ${this.formatConversationForLog(params.conversation)} run=${runId}: ${String(error)}`,
+          );
+          return;
+        }
         const message = error instanceof Error ? error.message : String(error);
         this.api.logger.warn(
           `codex turn failed ${this.formatConversationForLog(params.conversation)}: ${message}`,
         );
+        binding = (await this.clearActiveTurn(binding)) ?? binding;
         await this.sendText(
           params.conversation,
           await this.describeTurnFailure({
@@ -4534,6 +5082,14 @@ export class CodexPluginController {
         stopProgressTimer();
         typing?.stop();
         this.activeRuns.delete(key);
+        const suppressedDuringShutdown = this.shutdownOrphanedRunKeys.delete(key);
+        if (suppressedDuringShutdown) {
+          const pending = this.store.getPendingRequestByConversation(params.conversation);
+          if (pending) {
+            await this.store.removePendingRequest(pending.requestId);
+          }
+          return;
+        }
         binding = (await this.touchTaskHeartbeat(binding)) ?? binding;
         const pending = this.store.getPendingRequestByConversation(params.conversation);
         if (pending) {
@@ -4543,14 +5099,6 @@ export class CodexPluginController {
         this.api.logger.debug?.(
           `codex turn cleaned up ${this.formatConversationForLog(params.conversation)}`,
         );
-        queueMicrotask(() => {
-          void this.processQueuedInboundClaim(key).catch((error) => {
-            const message = error instanceof Error ? error.message : String(error);
-            this.api.logger.warn?.(
-              `queued inbound replay failed ${this.formatConversationForLog(params.conversation)}: ${message}`,
-            );
-          });
-        });
       });
   }
 
@@ -4717,26 +5265,38 @@ export class CodexPluginController {
       this.settings.defaultModel,
     );
     const effectiveThreadState = desired.effectiveState;
+    const runId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const collaborationMode: CollaborationMode = {
+      mode: "plan",
+      settings: {
+        model: desired.model || this.settings.defaultModel,
+        reasoningEffort: desired.reasoningEffort,
+        developerInstructions: null,
+      },
+    };
+    binding =
+      (await this.markActiveTurnRunning(binding, {
+        runId,
+        mode: "plan",
+        workspaceDir: params.workspaceDir,
+        prompt: params.prompt,
+        reason: "plan",
+        collaborationMode,
+        profile,
+      })) ?? binding;
     const run = this.client.startTurn({
       profile,
       sessionKey: binding?.sessionKey,
       workspaceDir: params.workspaceDir,
       prompt: params.prompt,
-      runId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      runId,
       existingThreadId: binding?.threadId,
       model: desired.model,
       reasoningEffort: desired.reasoningEffort,
       serviceTier: desired.serviceTier ?? undefined,
       approvalPolicy: desired.approvalPolicy,
       sandbox: desired.sandbox,
-      collaborationMode: {
-        mode: "plan",
-        settings: {
-          model: desired.model || this.settings.defaultModel,
-          reasoningEffort: desired.reasoningEffort,
-          developerInstructions: null,
-        },
-      },
+      collaborationMode,
       onPendingInput: async (state) => {
         if (state) {
           stopProgressTimer();
@@ -4761,6 +5321,13 @@ export class CodexPluginController {
               ),
               lastHeartbeatAt: Date.now(),
             }).catch(() => null)) ?? binding;
+        } else {
+          binding =
+            (await this.resumeTaskStateAfterPendingInput(
+              binding ?? this.store.getBinding(params.conversation),
+              "planned",
+              "Wait for Codex to finish the current plan",
+            ).catch(() => null)) ?? binding;
         }
         await this.handlePendingInputState(params.conversation, params.workspaceDir, state, run);
       },
@@ -4784,10 +5351,17 @@ export class CodexPluginController {
       workspaceDir: params.workspaceDir,
       mode: "plan",
       profile,
+      runId,
       handle: run,
     });
     void (run.result as Promise<import("./types.js").TurnResult>)
       .then(async (result) => {
+        if (this.shutdownOrphanedRunKeys.has(key)) {
+          this.api.logger.debug?.(
+            `codex plan completion suppressed during gateway stop ${this.formatConversationForLog(params.conversation)} run=${runId}`,
+          );
+          return;
+        }
         const threadId = result.threadId || run.getThreadId();
         if (threadId) {
           const state = await this.client
@@ -4823,11 +5397,13 @@ export class CodexPluginController {
               ),
               lastHeartbeatAt: Date.now(),
             }).catch(() => null)) ?? binding;
+          binding = (await this.clearActiveTurn(binding)) ?? binding;
           await this.sendText(params.conversation, formatInterruptedText("plan"));
           return;
         }
         if (result.planArtifact) {
           binding = (await this.updateAutomaticTaskStateFromPlan(binding, result.planArtifact)) ?? binding;
+          binding = (await this.clearActiveTurn(binding)) ?? binding;
           const implement = await this.store.putCallback({
             kind: "run-prompt",
             conversation: params.conversation,
@@ -4886,10 +5462,17 @@ export class CodexPluginController {
               nextAction: "Review the latest plan-mode response",
               lastHeartbeatAt: Date.now(),
             }).catch(() => null)) ?? binding;
+          binding = (await this.clearActiveTurn(binding)) ?? binding;
           await this.sendText(params.conversation, result.text.trim());
         }
       })
       .catch(async (error) => {
+        if (this.shutdownOrphanedRunKeys.has(key)) {
+          this.api.logger.debug?.(
+            `codex plan failure suppressed during gateway stop ${this.formatConversationForLog(params.conversation)} run=${runId}: ${String(error)}`,
+          );
+          return;
+        }
         binding =
           (await this.upsertTaskState((binding ?? this.store.getBinding(params.conversation))!, {
             stage: "blocked",
@@ -4897,12 +5480,21 @@ export class CodexPluginController {
             nextAction: "Retry the plan or continue manually",
             lastHeartbeatAt: Date.now(),
           }).catch(() => null)) ?? binding;
+        binding = (await this.clearActiveTurn(binding)) ?? binding;
         await this.sendText(params.conversation, formatFailureText("plan", error));
       })
       .finally(async () => {
         stopProgressTimer();
         typing?.stop();
         this.activeRuns.delete(key);
+        const suppressedDuringShutdown = this.shutdownOrphanedRunKeys.delete(key);
+        if (suppressedDuringShutdown) {
+          const pending = this.store.getPendingRequestByConversation(params.conversation);
+          if (pending) {
+            await this.store.removePendingRequest(pending.requestId);
+          }
+          return;
+        }
         const pending = this.store.getPendingRequestByConversation(params.conversation);
         if (pending) {
           await this.store.removePendingRequest(pending.requestId);
@@ -4962,12 +5554,13 @@ export class CodexPluginController {
       params.binding,
       this.settings.defaultModel,
     );
+    const runId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
     const run = this.client.startReview({
       profile,
       sessionKey: params.binding.sessionKey,
       workspaceDir: params.workspaceDir,
       threadId: params.binding.threadId,
-      runId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      runId,
       model: desired.model,
       reasoningEffort: desired.reasoningEffort,
       serviceTier: desired.serviceTier,
@@ -4989,6 +5582,7 @@ export class CodexPluginController {
       workspaceDir: params.workspaceDir,
       mode: "review",
       profile,
+      runId,
       handle: run,
     });
     void (run.result as Promise<import("./types.js").ReviewResult>)
@@ -6264,6 +6858,106 @@ export class CodexPluginController {
       await responders.reply(ackText);
       return;
     }
+    if (callback.kind === "resume-task") {
+      const binding = this.store.getBinding(callback.conversation);
+      await this.store.removeCallback(callback.token);
+      if (!binding) {
+        await responders.reply("No Codex binding for this conversation.");
+        return;
+      }
+      const conversation = {
+        ...callback.conversation,
+        threadId: responders.conversation.threadId,
+      };
+      const workspaceDir = binding.workspaceDir || resolveWorkspaceDir({
+        bindingWorkspaceDir: binding.workspaceDir,
+        configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
+        serviceWorkspaceDir: this.serviceWorkspaceDir,
+      });
+      await this.startTurn({
+        conversation,
+        binding,
+        workspaceDir,
+        prompt: buildResumeTaskPrompt(binding.taskState),
+        reason: "command",
+      });
+      const nextBinding = this.store.getBinding(callback.conversation) ?? binding;
+      const statusCard = await this.buildStatusCard(conversation, nextBinding, true);
+      await responders.editPicker({
+        text: `${statusCard.text}\n\nResuming Codex from the latest checkpoint.`,
+        buttons: statusCard.buttons ?? [],
+      });
+      return;
+    }
+    if (callback.kind === "mark-verified") {
+      let binding = this.store.getBinding(callback.conversation);
+      await this.store.removeCallback(callback.token);
+      if (!binding) {
+        await responders.reply("No Codex binding for this conversation.");
+        return;
+      }
+      const verificationSummary =
+        normalizeTaskText(binding.taskState?.latestEvidence) ||
+        normalizeTaskText(binding.taskState?.checkpoint?.summary) ||
+        "Verified from the cockpit status card";
+      binding = await this.upsertTaskState(binding, {
+        stage: "done",
+        nextAction: "Send the next task message in this thread",
+        blocker: null,
+        checkpoint: null,
+        verification: {
+          status: "verified",
+          summary: verificationSummary,
+          residualRisk: binding.taskState?.verification?.residualRisk,
+          updatedAt: Date.now(),
+        },
+        lastHeartbeatAt: Date.now(),
+      });
+      const statusCard = await this.buildStatusCard(
+        {
+          ...callback.conversation,
+          threadId: responders.conversation.threadId,
+        },
+        binding,
+        true,
+      );
+      await responders.editPicker({
+        text: `${statusCard.text}\n\nMarked this task as verified.`,
+        buttons: statusCard.buttons ?? [],
+      });
+      return;
+    }
+    if (callback.kind === "clear-task-blocker") {
+      let binding = this.store.getBinding(callback.conversation);
+      await this.store.removeCallback(callback.token);
+      if (!binding) {
+        await responders.reply("No Codex binding for this conversation.");
+        return;
+      }
+      const active = this.activeRuns.get(buildConversationKey(callback.conversation));
+      const activeTaskMode =
+        active?.mode === "plan" ? "plan" : active?.mode === "default" ? "default" : undefined;
+      binding = await this.upsertTaskState(binding, {
+        stage: getTaskCardReadyStage(binding.taskState, activeTaskMode),
+        nextAction: getTaskCardReadyNextAction(binding.taskState, activeTaskMode),
+        blocker: null,
+        checkpoint: isInlineBlockerCheckpoint(binding.taskState?.checkpoint?.summary) ? null : undefined,
+        lastHeartbeatAt: Date.now(),
+      });
+      const statusCard = await this.buildStatusCard(
+        {
+          ...callback.conversation,
+          threadId: responders.conversation.threadId,
+        },
+        binding,
+        true,
+      );
+      await responders.editPicker({
+        text: `${statusCard.text}\n\nCleared the current blocker.`,
+        buttons: statusCard.buttons ?? [],
+      });
+      return;
+    }
     if (callback.kind === "toggle-fast") {
       const binding = this.store.getBinding(callback.conversation);
       await this.store.removeCallback(callback.token);
@@ -7071,6 +7765,7 @@ export class CodexPluginController {
       contextUsage: existing?.contextUsage,
       preferences: params.preferences ?? existing?.preferences,
       taskState: existing?.taskState,
+      activeTurn: existing?.activeTurn,
       updatedAt: Date.now(),
     };
     await this.store.upsertBinding(record);
@@ -7220,24 +7915,6 @@ export class CodexPluginController {
       threadId: "threadId" in conversation ? conversation.threadId : undefined,
     };
 
-    const readStateForRestore = async (): Promise<ThreadState | undefined> => {
-      try {
-        return await this.client.readThreadState({
-          profile,
-          sessionKey: binding.sessionKey,
-          threadId: binding.threadId,
-        });
-      } catch (error) {
-        if (isMissingThreadError(error)) {
-          this.api.logger.warn(
-            `codex bound restore could not read thread state ${this.formatConversationForLog(restoreConversation)} boundThread=${binding.threadId}: ${String(error)}`,
-          );
-          return undefined;
-        }
-        throw error;
-      }
-    };
-
     const readReplayForRestore = async (): Promise<{
       lastUserMessage?: string;
       lastAssistantMessage?: string;
@@ -7259,31 +7936,22 @@ export class CodexPluginController {
       }
     };
 
-    const [initialState, replay] = await Promise.all([
-      readStateForRestore(),
-      readReplayForRestore(),
-    ]);
+    const initialState = await this.readBoundThreadStateWithRetry(
+      binding,
+      restoreConversation,
+      "bound restore",
+    );
+    if (initialState === null) {
+      const nextBinding = await this.markBindingThreadMissing(binding);
+      return [this.formatMissingBoundThreadMessage(nextBinding)];
+    }
+    const replay = await readReplayForRestore();
     const state =
       (await this.reconcileThreadConfiguration(binding, {
         threadState: initialState,
         context: "restore desired thread settings",
       })) ?? initialState;
-
-    const nextBinding =
-      (state?.threadName && state.threadName !== binding.threadTitle) ||
-      (state?.cwd?.trim() && state.cwd.trim() !== binding.workspaceDir)
-        ? {
-            ...binding,
-            threadTitle: state.threadName?.trim() || binding.threadTitle,
-            workspaceDir: state.cwd?.trim() || binding.workspaceDir,
-            contextUsage: binding.contextUsage,
-            updatedAt: Date.now(),
-          }
-        : binding;
-
-    if (nextBinding !== binding) {
-      await this.store.upsertBinding(nextBinding);
-    }
+    const nextBinding = await this.refreshBindingFromThreadState(binding, state);
 
     const messages = [
       formatBoundThreadSummary({
