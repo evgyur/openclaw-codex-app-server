@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { existsSync, promises as fs } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type {
   PluginConversationBindingResolvedEvent,
@@ -99,6 +99,7 @@ import {
   type StoredPendingBind,
   type StoredPendingRequest,
 } from "./types.js";
+import { loadOpenClawCompatModule } from "./openclaw-sdk-compat.js";
 
 type ActiveRunRecord = {
   conversation: ConversationTarget;
@@ -180,31 +181,25 @@ function getDiscordSdkCompatOverride(): DiscordSdkCompat | undefined {
   return root[DISCORD_SDK_OVERRIDE_KEY];
 }
 
-function resolveOpenClawDistModuleUrl(relativePath: string): string | undefined {
-  try {
-    const entryPath = require.resolve("openclaw");
-    return pathToFileURL(path.join(path.dirname(entryPath), relativePath)).href;
-  } catch {
-    return undefined;
-  }
-}
-
 async function loadDiscordSdkCompat(): Promise<DiscordSdkCompat> {
-  const apiModuleUrl = resolveOpenClawDistModuleUrl("extensions/discord/api.js");
-  const runtimeModuleUrl = resolveOpenClawDistModuleUrl("extensions/discord/runtime-api.js");
-  if (!apiModuleUrl || !runtimeModuleUrl) {
-    throw new Error("Failed to resolve OpenClaw dist Discord helper modules.");
-  }
   const [apiModule, runtimeModule] = await Promise.all([
-    import(apiModuleUrl),
-    import(runtimeModuleUrl),
+    loadOpenClawCompatModule<{ buildDiscordComponentMessage: DiscordSdkCompat["buildDiscordComponentMessage"]; resolveDiscordAccount: DiscordSdkCompat["resolveDiscordAccount"] }>({
+      specifier: "openclaw/plugin-sdk/discord",
+      fallbackRelativePath: "dist/plugin-sdk/discord.js",
+      label: "discord",
+    }),
+    loadOpenClawCompatModule<{ editDiscordComponentMessage: DiscordSdkCompat["editDiscordComponentMessage"]; registerBuiltDiscordComponentMessage: DiscordSdkCompat["registerBuiltDiscordComponentMessage"] }>({
+      specifier: "openclaw/plugin-sdk/discord-runtime-api",
+      fallbackRelativePath: "dist/extensions/discord/runtime-api.js",
+      label: "discord-runtime",
+    }),
   ]);
   return {
     buildDiscordComponentMessage: apiModule.buildDiscordComponentMessage,
     editDiscordComponentMessage: runtimeModule.editDiscordComponentMessage,
     registerBuiltDiscordComponentMessage: runtimeModule.registerBuiltDiscordComponentMessage,
     resolveDiscordAccount: apiModule.resolveDiscordAccount,
-  } as unknown as DiscordSdkCompat;
+  } as DiscordSdkCompat;
 }
 
 let discordSdkCompatPromise: Promise<DiscordSdkCompat> | null = null;
