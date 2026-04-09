@@ -100,6 +100,15 @@ describe("command help metadata", () => {
     expect(text).toContain("With no flags, this shows the current status card");
   });
 
+  it("documents cockpit task, verification, and checkpoint commands", () => {
+    expect(renderCommandHelpText("cas_task")).toContain("/cas_task");
+    expect(renderCommandHelpText("cas_task")).toContain("goal <text>");
+    expect(renderCommandHelpText("cas_verify")).toContain("/cas_verify");
+    expect(renderCommandHelpText("cas_verify")).toContain("verified");
+    expect(renderCommandHelpText("cas_checkpoint")).toContain("/cas_checkpoint");
+    expect(renderCommandHelpText("cas_checkpoint")).toContain("--next <text>");
+  });
+
   it("returns command help when args are help, --help, or em-dash help", async () => {
     const controller = new CodexPluginController(createApiMock());
     const helpReply = await controller.handleCommand("cas_plan", buildDiscordCommandContext({

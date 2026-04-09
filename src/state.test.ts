@@ -136,6 +136,40 @@ describe("state store", () => {
     expect(reloaded.getCallback(replyCallback.token)?.kind).toBe("reply-text");
   });
 
+  it("replaces duplicate callbacks and prunes expired entries on put", async () => {
+    const dir = await makeStoreDir();
+    const store = await makeStore(dir);
+    const conversation = {
+      channel: "telegram" as const,
+      accountId: "default",
+      conversationId: "123",
+    };
+
+    const expired = await store.putCallback({
+      kind: "show-model-picker",
+      conversation,
+      ttlMs: -1,
+    });
+    const first = await store.putCallback({
+      kind: "refresh-status",
+      conversation,
+    });
+    const second = await store.putCallback({
+      kind: "refresh-status",
+      conversation,
+    });
+    const reloaded = await makeStore(dir);
+    const snapshot = JSON.parse(await fs.readFile(reloaded.filePath, "utf8")) as {
+      callbacks: Array<{ token: string; kind: string }>;
+    };
+
+    expect(reloaded.getCallback(expired.token)).toBeNull();
+    expect(second.token).toBe(first.token);
+    expect(reloaded.getCallback(first.token)?.kind).toBe("refresh-status");
+    expect(snapshot.callbacks).toHaveLength(1);
+    expect(snapshot.callbacks[0]?.token).toBe(first.token);
+  });
+
   it("removes pending requests and related callbacks", async () => {
     const store = await makeStore();
     await store.upsertPendingRequest({
@@ -279,6 +313,69 @@ describe("state store", () => {
       updatedAt,
     });
     expect(binding?.permissionsMode).toBe("full-access");
+  });
+
+  it("persists cockpit task state in bindings across reload", async () => {
+    const dir = await makeStoreDir();
+    const store = await makeStore(dir);
+    const updatedAt = Date.now();
+    await store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: buildPluginSessionKey("thread-1"),
+      threadId: "thread-1",
+      workspaceDir: "/tmp/work",
+      taskState: {
+        goal: "Roll out the cockpit task card",
+        stage: "executing",
+        nextAction: "Deploy the tested plugin build",
+        latestEvidence: "Local vitest run is green",
+        blocker: "Waiting for maintenance window",
+        lastHeartbeatAt: updatedAt - 60_000,
+        verification: {
+          status: "partial",
+          summary: "Local tests passed; prod smoke still pending",
+          updatedAt,
+        },
+        checkpoint: {
+          summary: "Canonical repo updated and ready to sync",
+          nextAction: "Backup runtime artifact and copy the new build",
+          savedAt: updatedAt,
+        },
+        updatedAt,
+      },
+      updatedAt,
+    });
+
+    const reloaded = await makeStore(dir);
+    const binding = reloaded.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123",
+    });
+
+    expect(binding?.taskState).toEqual({
+      goal: "Roll out the cockpit task card",
+      stage: "executing",
+      nextAction: "Deploy the tested plugin build",
+      latestEvidence: "Local vitest run is green",
+      blocker: "Waiting for maintenance window",
+      lastHeartbeatAt: updatedAt - 60_000,
+      verification: {
+        status: "partial",
+        summary: "Local tests passed; prod smoke still pending",
+        updatedAt,
+      },
+      checkpoint: {
+        summary: "Canonical repo updated and ready to sync",
+        nextAction: "Backup runtime artifact and copy the new build",
+        savedAt: updatedAt,
+      },
+      updatedAt,
+    });
   });
 
   it("migrates legacy profile and permission fields into permissions mode", async () => {

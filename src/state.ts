@@ -88,6 +88,24 @@ type PutCallbackInput =
       ttlMs?: number;
     }
   | {
+      kind: "resume-task";
+      conversation: ConversationTarget;
+      token?: string;
+      ttlMs?: number;
+    }
+  | {
+      kind: "mark-verified";
+      conversation: ConversationTarget;
+      token?: string;
+      ttlMs?: number;
+    }
+  | {
+      kind: "clear-task-blocker";
+      conversation: ConversationTarget;
+      token?: string;
+      ttlMs?: number;
+    }
+  | {
       kind: "show-reasoning-picker";
       conversation: ConversationTarget;
       token?: string;
@@ -249,6 +267,25 @@ function normalizeConversationPreferences(
     preferredServiceTier: value.preferredServiceTier,
     updatedAt: value.updatedAt,
   };
+}
+
+function normalizeCallbackIdentityValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry) => normalizeCallbackIdentityValue(entry));
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>)
+      .filter(([key]) => key !== "token" && key !== "createdAt" && key !== "expiresAt")
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => [key, normalizeCallbackIdentityValue(entry)]),
+  );
+}
+
+function buildCallbackIdentity(entry: CallbackAction): string {
+  return JSON.stringify(normalizeCallbackIdentityValue(entry));
 }
 
 function normalizeSnapshot(value?: Partial<StoreSnapshot>): StoreSnapshot {
@@ -539,19 +576,43 @@ export class PluginStateStore {
                   createdAt: now,
                   expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
                   }
-                : callback.kind === "toggle-fast"
-                  ? {
-                      kind: "toggle-fast",
-                      conversation: callback.conversation,
-                      token: callback.token ?? this.createCallbackToken(),
-                      createdAt: now,
-                      expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
-                    }
-                : callback.kind === "show-reasoning-picker"
-                  ? {
-                      kind: "show-reasoning-picker",
-                      conversation: callback.conversation,
-                      token: callback.token ?? this.createCallbackToken(),
+      : callback.kind === "toggle-fast"
+        ? {
+            kind: "toggle-fast",
+            conversation: callback.conversation,
+            token: callback.token ?? this.createCallbackToken(),
+            createdAt: now,
+            expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
+          }
+      : callback.kind === "resume-task"
+        ? {
+            kind: "resume-task",
+            conversation: callback.conversation,
+            token: callback.token ?? this.createCallbackToken(),
+            createdAt: now,
+            expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
+          }
+      : callback.kind === "mark-verified"
+        ? {
+            kind: "mark-verified",
+            conversation: callback.conversation,
+            token: callback.token ?? this.createCallbackToken(),
+            createdAt: now,
+            expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
+          }
+      : callback.kind === "clear-task-blocker"
+        ? {
+            kind: "clear-task-blocker",
+            conversation: callback.conversation,
+            token: callback.token ?? this.createCallbackToken(),
+            createdAt: now,
+            expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
+          }
+      : callback.kind === "show-reasoning-picker"
+        ? {
+            kind: "show-reasoning-picker",
+            conversation: callback.conversation,
+            token: callback.token ?? this.createCallbackToken(),
                       createdAt: now,
                       expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
                     }
@@ -667,8 +728,16 @@ export class PluginStateStore {
                       createdAt: now,
                       expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
                     };
+    this.pruneExpired(now);
+    const identity = buildCallbackIdentity(entry);
+    const existing = this.snapshot.callbacks.find(
+      (current) => buildCallbackIdentity(current) === identity,
+    );
+    if (existing && !callback.token) {
+      return existing;
+    }
     this.snapshot.callbacks = this.snapshot.callbacks.filter(
-      (current) => current.token !== entry.token,
+      (current) => current.token !== entry.token && buildCallbackIdentity(current) !== identity,
     );
     this.snapshot.callbacks.push(entry);
     await this.save();

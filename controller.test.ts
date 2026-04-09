@@ -6,7 +6,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi, PluginCommandContext, ReplyPayload } from "openclaw/plugin-sdk";
 import { CodexAppServerClient } from "./client.js";
 import { CodexPluginController } from "./controller.js";
-import { buildConversationKey } from "./state.js";
 
 const TEST_TELEGRAM_PEER_ID = "telegram-user-1";
 const DISCORD_SDK_OVERRIDE_KEY = "__OPENCLAW_CODEX_APP_SERVER_TEST_DISCORD_SDK__";
@@ -1708,10 +1707,9 @@ describe("Discord controller flows", () => {
     );
 
     expect(reply.text).toContain("Binding: none");
-    expect(reply.text).toContain("Topic is locally known but not core-bound; run /cas_resume.");
     expect(reply.text).toContain(`Plugin version: ${TEST_PLUGIN_VERSION}`);
-    expect(reply.text).toContain("Project folder: /repo/discrawl");
-    expect(reply.text).toContain("Thread: thread-1");
+    expect(reply.text).not.toContain("Project folder: /repo/discrawl");
+    expect(reply.text).not.toContain("Session: session-1");
   });
 
   it("does not hydrate a denied pending bind into cas_status", async () => {
@@ -4771,77 +4769,6 @@ describe("Discord controller flows", () => {
     }
   });
 
-  it("does not resend the same questionnaire state when plan mode repeats the same pending input", async () => {
-    const harness = await createControllerHarness();
-    const { controller, sendMessageTelegram } = harness;
-    let resolveResult: ((value: unknown) => void) | undefined;
-    const result = new Promise((resolve) => {
-      resolveResult = resolve;
-    });
-    const repeatedState = {
-      requestId: "req-plan-repeat-1",
-      options: [],
-      expiresAt: Date.now() + 60_000,
-      method: "item/tool/requestUserInput",
-      questionnaire: {
-        currentIndex: 0,
-        questions: [
-          {
-            index: 0,
-            id: "spec-source",
-            header: "Spec Source",
-            prompt: "Where is the spec?",
-            options: [
-              { key: "A", label: "Current clone", description: "Use the current clone." },
-            ],
-            guidance: [],
-            allowFreeform: true,
-          },
-        ],
-        answers: [null],
-        responseMode: "structured",
-      },
-    };
-    (controller as any).client.startTurn = vi.fn((params: any) => {
-      void Promise.resolve()
-        .then(() => params.onPendingInput?.(structuredClone(repeatedState)))
-        .then(() => params.onPendingInput?.(structuredClone(repeatedState)));
-      return {
-        result,
-        getThreadId: () => "thread-1",
-        queueMessage: vi.fn(async () => false),
-        interrupt: vi.fn(async () => {}),
-        isAwaitingInput: () => true,
-        submitPendingInput: vi.fn(async () => false),
-        submitPendingInputPayload: vi.fn(async () => false),
-      };
-    });
-
-    await (controller as any).startPlan({
-      conversation: {
-        channel: "telegram",
-        accountId: "default",
-        conversationId: TEST_TELEGRAM_PEER_ID,
-      },
-      binding: null,
-      workspaceDir: "/repo/openclaw",
-      prompt: "Ask once.",
-    });
-
-    await vi.waitFor(() => {
-      const questionnaireMessages = sendMessageTelegram.mock.calls.filter((call) => {
-        const [, text] = call as unknown as [unknown, unknown];
-        return typeof text === "string" && text.includes("Where is the spec?");
-      });
-      expect(questionnaireMessages).toHaveLength(1);
-    });
-
-    resolveResult?.({
-      threadId: "thread-1",
-      aborted: true,
-    });
-  });
-
   it("tells the user to log back in when Codex reports OpenAI auth is required", async () => {
     const { controller, clientMock, sendMessageTelegram } = await createControllerHarness();
     clientMock.readAccount.mockResolvedValue({
@@ -7432,91 +7359,6 @@ describe("Discord controller flows", () => {
       aborted: true,
       terminalStatus: "interrupted",
     });
-  });
-
-  it("edits the questionnaire in place for free-form answers without sending an extra Telegram reply", async () => {
-    const { controller } = await createControllerHarness();
-    await (controller as any).store.upsertPendingRequest({
-      requestId: "questionnaire-freeform-1",
-      conversation: {
-        channel: "telegram",
-        accountId: "default",
-        conversationId: "123",
-      },
-      threadId: "thread-1",
-      workspaceDir: "/repo/openclaw",
-      state: {
-        requestId: "questionnaire-freeform-1",
-        options: [],
-        expiresAt: Date.now() + 60_000,
-        method: "item/tool/requestUserInput",
-        questionnaire: {
-          currentIndex: 0,
-          questions: [
-            {
-              index: 0,
-              id: "scope",
-              header: "Scope",
-              prompt: "Which path should Codex take?",
-              options: [{ key: "A", label: "Safe", description: "Small prod-safe slice." }],
-              guidance: [],
-              allowFreeform: true,
-            },
-          ],
-          answers: [null],
-          responseMode: "structured",
-        },
-      },
-      updatedAt: Date.now(),
-    });
-    const conversation = {
-      channel: "telegram",
-      accountId: "default",
-      conversationId: "123",
-    } as const;
-    (controller as any).activeRuns.set(buildConversationKey(conversation), {
-      conversation,
-      workspaceDir: "/repo/openclaw",
-      mode: "plan",
-      profile: "default",
-      handle: {
-        queueMessage: vi.fn(async () => false),
-        interrupt: vi.fn(async () => {}),
-        isAwaitingInput: () => true,
-        submitPendingInput: vi.fn(async () => false),
-        submitPendingInputPayload: vi.fn(async () => false),
-      },
-    });
-    const callback = await (controller as any).store.putCallback({
-      kind: "pending-questionnaire",
-      conversation,
-      requestId: "questionnaire-freeform-1",
-      questionIndex: 0,
-      action: "freeform",
-    });
-    const reply = vi.fn(async () => {});
-    const editMessage = vi.fn(async (_payload: any) => {});
-
-    await controller.handleTelegramInteractive({
-      channel: "telegram",
-      accountId: "default",
-      conversationId: "123",
-      callback: {
-        payload: callback.token,
-        messageId: "10",
-        chatId: "123",
-      },
-      respond: {
-        clearButtons: vi.fn(async () => {}),
-        reply,
-        editMessage,
-      },
-    } as any);
-
-    expect(reply).not.toHaveBeenCalled();
-    expect(editMessage).toHaveBeenCalledWith(expect.objectContaining({
-      text: expect.stringContaining("Current answer: waiting for your free-form reply"),
-    }));
   });
 
   it("clears pending questionnaire blockers once the turn resumes", async () => {

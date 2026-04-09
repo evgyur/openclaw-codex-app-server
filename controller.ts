@@ -265,35 +265,6 @@ const PLUGIN_VERSION = (() => {
   }
 })();
 
-function buildQuestionnaireDeliverySignature(state: PendingInputState | null | undefined): string | null {
-  const questionnaire = state?.questionnaire;
-  if (!questionnaire) {
-    return null;
-  }
-  return JSON.stringify({
-    requestId: state.requestId,
-    promptText: state.promptText ?? null,
-    method: state.method ?? null,
-    currentIndex: questionnaire.currentIndex,
-    awaitingFreeform: Boolean(questionnaire.awaitingFreeform),
-    responseMode: questionnaire.responseMode ?? null,
-    answers: questionnaire.answers,
-    questions: questionnaire.questions.map((question) => ({
-      index: question.index,
-      id: question.id,
-      header: question.header ?? null,
-      prompt: question.prompt,
-      allowFreeform: Boolean(question.allowFreeform),
-      guidance: question.guidance,
-      options: question.options.map((option) => ({
-        key: option.key,
-        label: option.label,
-        description: option.description,
-      })),
-    })),
-  });
-}
-
 function getSkillsPickerPageSize(channel: string): number {
   return channel === "discord" ? 6 : 8;
 }
@@ -2627,7 +2598,7 @@ export class CodexPluginController {
       case "cas_status":
         return await this.handleStatusCommand(
           conversation,
-          binding ?? (conversation ? this.store.getBinding(conversation) : null),
+          binding,
           args,
           Boolean(currentBinding || binding),
         );
@@ -5427,9 +5398,6 @@ export class CodexPluginController {
     }
     if (state.questionnaire) {
       const existing = this.store.getPendingRequestById(state.requestId);
-      const shouldSendQuestionnaire =
-        buildQuestionnaireDeliverySignature(existing?.state) !==
-        buildQuestionnaireDeliverySignature(state);
       await this.store.upsertPendingRequest({
         requestId: state.requestId,
         conversation,
@@ -5439,9 +5407,7 @@ export class CodexPluginController {
         createdAt: existing?.createdAt ?? Date.now(),
         updatedAt: Date.now(),
       });
-      if (shouldSendQuestionnaire) {
-        await this.sendPendingQuestionnaire(conversation, state);
-      }
+      await this.sendPendingQuestionnaire(conversation, state);
       return;
     }
     const callbacks = await Promise.all(
@@ -6487,6 +6453,9 @@ export class CodexPluginController {
         questionnaire.awaitingFreeform = true;
         pending.updatedAt = Date.now();
         await this.store.upsertPendingRequest(pending);
+        await responders.reply(
+          `Send a free-form answer for question ${questionnaire.currentIndex + 1} of ${questionnaire.questions.length} and I’ll record it.`,
+        );
         await this.sendPendingQuestionnaire(callback.conversation, pending.state, {
           editMessage: async (text, buttons) => {
             await responders.editPicker({ text, buttons });
@@ -7863,9 +7832,7 @@ export class CodexPluginController {
           }
         : undefined);
     const threadNote =
-      binding && !bindingActive
-        ? "Topic is locally known but not core-bound; run /cas_resume."
-        : binding && !threadState
+      binding && !threadState
         ? "Live thread details are unavailable until Codex materializes the thread, usually after the first user message. Model, reasoning, and fast-mode changes made here are saved as defaults until then."
         : undefined;
     this.api.logger.debug?.(

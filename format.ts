@@ -178,6 +178,27 @@ function appendTaskCardLines(lines: string[], taskState: TaskCardState | undefin
   if (taskState?.blocker?.trim()) {
     lines.push(`Blocker: ${taskState.blocker.trim()}`);
   }
+  if (
+    taskState?.lastRunSummary?.trim() ||
+    taskState?.lastFailure?.trim() ||
+    taskState?.resumeReason?.trim() ||
+    taskState?.lastVerifiedAt
+  ) {
+    lines.push("Resume ledger:");
+    if (taskState.lastRunSummary?.trim()) {
+      lines.push(`Last run: ${taskState.lastRunSummary.trim()}`);
+    }
+    if (taskState.lastFailure?.trim()) {
+      lines.push(`Last failure: ${taskState.lastFailure.trim()}`);
+    }
+    if (taskState.resumeReason?.trim()) {
+      lines.push(`Resume reason: ${taskState.resumeReason.trim()}`);
+    }
+    const lastVerified = formatDateAge(taskState.lastVerifiedAt);
+    if (lastVerified) {
+      lines.push(`Last verified: ${lastVerified}`);
+    }
+  }
   if (taskState?.verification) {
     lines.push(`Verification: ${formatVerificationStatus(taskState.verification.status)}`);
     if (taskState.verification.summary?.trim()) {
@@ -618,39 +639,6 @@ export function formatCodexContextUsageSnapshot(
   }`;
 }
 
-function getLeanContextHint(params: {
-  bindingActive?: boolean;
-  contextUsage?: ContextUsageSnapshot;
-  taskState?: TaskCardState;
-}): string | undefined {
-  if (!params.bindingActive || !params.contextUsage) {
-    return undefined;
-  }
-  const percentFull =
-    typeof params.contextUsage.totalTokens === "number" &&
-      typeof params.contextUsage.contextWindow === "number" &&
-      params.contextUsage.contextWindow > 0
-      ? Math.max(
-          0,
-          Math.min(100, Math.round((params.contextUsage.totalTokens / params.contextUsage.contextWindow) * 100)),
-        )
-      : typeof params.contextUsage.remainingPercent === "number"
-        ? Math.max(0, Math.min(100, Math.round(100 - params.contextUsage.remainingPercent)))
-        : undefined;
-  if (typeof percentFull !== "number" || percentFull < 50) {
-    return undefined;
-  }
-  const hasCheckpoint = Boolean(params.taskState?.checkpoint?.summary?.trim());
-  if (percentFull >= 70) {
-    return hasCheckpoint
-      ? "Lean-context hint: context is getting heavy. If this is a new phase, continue from the latest checkpoint instead of dragging the full transcript tail."
-      : "Lean-context hint: context is getting heavy. Save a checkpoint before the next phase change with /cas_checkpoint save <summary> --next <step>.";
-  }
-  return hasCheckpoint
-    ? "Lean-context hint: if this task is shifting phase or feels noisy, continue from the latest checkpoint."
-    : "Lean-context hint: add a checkpoint soon so you can cut to a fresh continuation without losing task state.";
-}
-
 export function formatCodexStatusText(params: {
   pluginVersion?: string;
   threadState?: ThreadState;
@@ -722,14 +710,6 @@ export function formatCodexStatusText(params: {
     lines.push(`Thread: ${threadId}`);
   }
   appendTaskCardLines(lines, effectiveTaskState);
-  const leanContextHint = getLeanContextHint({
-    bindingActive: params.bindingActive,
-    contextUsage: params.contextUsage,
-    taskState: effectiveTaskState,
-  });
-  if (leanContextHint) {
-    lines.push("", leanContextHint);
-  }
   const visibleRateLimits = selectVisibleCodexRateLimits({
     rateLimits: params.rateLimits,
     currentModel: params.threadState?.model,

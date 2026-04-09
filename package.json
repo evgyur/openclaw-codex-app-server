@@ -1,6 +1,6 @@
 {
   "name": "openclaw-codex-app-server",
-  "version": "0.0.0",
+  "version": "0.6.0",
   "description": "Independent OpenClaw plugin for the Codex App Server protocol",
   "author": "PwrDrvr LLC",
   "license": "MIT",

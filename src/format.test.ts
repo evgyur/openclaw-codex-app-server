@@ -238,6 +238,9 @@ describe("formatCodexStatusText", () => {
     });
 
     expect(text).toContain("Context usage: 139k / 258k tokens used (54% full)");
+    expect(text).toContain(
+      "Lean-context hint: add a checkpoint soon so you can cut to a fresh continuation without losing task state.",
+    );
   });
 
   it("falls back to the bound thread title when status has no live thread name", () => {
@@ -257,6 +260,158 @@ describe("formatCodexStatusText", () => {
     });
 
     expect(text).toContain("Binding: What is wrong with this layout? (openclaw-app-server)");
+  });
+
+  it("renders a task card by default so cockpit state is always visible", () => {
+    const text = formatCodexStatusText({
+      bindingActive: true,
+      threadState: {
+        threadId: "thread-123",
+        threadName: "Chip cockpit prod slice",
+        model: "gpt-5.4",
+        modelProvider: "openai",
+        cwd: "/repo/openclaw",
+      },
+      projectFolder: "/repo/openclaw",
+      worktreeFolder: "/repo/openclaw",
+      rateLimits: [],
+    });
+
+    expect(text).toContain("Task card:");
+    expect(text).toContain("Stage: executing");
+    expect(text).toContain("Goal: Chip cockpit prod slice");
+    expect(text).toContain("Next action: Send the next task message in this thread");
+    expect(text).toContain("Verification: Unverified");
+  });
+
+  it("prefills the task card from the bound thread context when no task state exists yet", () => {
+    const text = formatCodexStatusText({
+      bindingActive: true,
+      threadState: {
+        threadId: "thread-123",
+        threadName: "chipcdx prod flow",
+        model: "gpt-5.4",
+        modelProvider: "openai",
+        cwd: "/repo/openclaw",
+      },
+      projectFolder: "/repo/openclaw",
+      worktreeFolder: "/repo/openclaw",
+      rateLimits: [],
+    });
+
+    expect(text).toContain("Task card:");
+    expect(text).toContain("Stage: executing");
+    expect(text).toContain("Goal: chipcdx prod flow");
+    expect(text).toContain("Next action: Send the next task message in this thread");
+    expect(text).toContain("Verification: Unverified");
+  });
+
+  it("prefills the next action from plan mode when no explicit task state exists yet", () => {
+    const text = formatCodexStatusText({
+      bindingActive: true,
+      threadState: {
+        threadId: "thread-123",
+        threadName: "cockpit roadmap",
+        model: "gpt-5.4",
+        modelProvider: "openai",
+        cwd: "/repo/openclaw",
+      },
+      projectFolder: "/repo/openclaw",
+      worktreeFolder: "/repo/openclaw",
+      planMode: true,
+      rateLimits: [],
+    });
+
+    expect(text).toContain("Stage: planned");
+    expect(text).toContain("Goal: cockpit roadmap");
+    expect(text).toContain("Next action: Review the current plan or send guidance");
+  });
+
+  it("renders the cockpit task card, verification state, checkpoint, and heartbeat", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-06T12:30:00.000Z"));
+
+    const text = formatCodexStatusText({
+      bindingActive: true,
+      threadState: {
+        threadId: "thread-123",
+        threadName: "Chip cockpit prod slice",
+        model: "gpt-5.4",
+        modelProvider: "openai",
+        cwd: "/repo/openclaw",
+      },
+      projectFolder: "/repo/openclaw",
+      worktreeFolder: "/repo/openclaw",
+      rateLimits: [],
+      taskState: {
+        goal: "Ship the prod-safe cockpit task card",
+        stage: "verifying",
+        nextAction: "Run the prod smoke checks",
+        latestEvidence: "Vitest green for task card and checkpoint flows",
+        blocker: "Waiting for a live Telegram smoke reply",
+        lastHeartbeatAt: new Date("2026-04-06T12:28:00.000Z").getTime(),
+        verification: {
+          status: "verified-risk",
+          summary: "Local and host-side tests passed before rollout",
+          residualRisk: "Telegram callback drift after deploy",
+          updatedAt: new Date("2026-04-06T12:27:00.000Z").getTime(),
+        },
+        checkpoint: {
+          summary: "Plugin built and staged for live deploy",
+          nextAction: "Copy extension to intel64 runtime and rerun /cas_status",
+          savedAt: new Date("2026-04-06T12:26:00.000Z").getTime(),
+        },
+        updatedAt: new Date("2026-04-06T12:28:00.000Z").getTime(),
+      },
+    });
+
+    expect(text).toContain("Task card:");
+    expect(text).toContain("Stage: verifying");
+    expect(text).toContain("Goal: Ship the prod-safe cockpit task card");
+    expect(text).toContain("Next action: Run the prod smoke checks");
+    expect(text).toContain("Latest evidence: Vitest green for task card and checkpoint flows");
+    expect(text).toContain("Blocker: Waiting for a live Telegram smoke reply");
+    expect(text).toContain("Verification: Verified with residual risk");
+    expect(text).toContain("Verification summary: Local and host-side tests passed before rollout");
+    expect(text).toContain("Residual risk: Telegram callback drift after deploy");
+    expect(text).toContain("Checkpoint: Plugin built and staged for live deploy");
+    expect(text).toContain("Checkpoint next: Copy extension to intel64 runtime and rerun /cas_status");
+    expect(text).toContain("Last heartbeat: 2m ago");
+  });
+
+  it("nudges fresh continuation from the latest checkpoint when context is already heavy", () => {
+    const text = formatCodexStatusText({
+      bindingActive: true,
+      threadState: {
+        threadId: "thread-123",
+        threadName: "Chip cockpit prod slice",
+        model: "gpt-5.4",
+        modelProvider: "openai",
+        cwd: "/repo/openclaw",
+      },
+      projectFolder: "/repo/openclaw",
+      worktreeFolder: "/repo/openclaw",
+      contextUsage: {
+        totalTokens: 201_000,
+        contextWindow: 258_000,
+      },
+      rateLimits: [],
+      taskState: {
+        goal: "Ship the prod-safe cockpit task card",
+        stage: "verifying",
+        checkpoint: {
+          summary: "Plugin built and staged for live deploy",
+          nextAction: "Copy extension to intel64 runtime and rerun /cas_status",
+          savedAt: new Date("2026-04-06T12:26:00.000Z").getTime(),
+        },
+        updatedAt: new Date("2026-04-06T12:28:00.000Z").getTime(),
+      },
+    });
+
+    expect(text).toContain("Context usage: 201k / 258k tokens used (78% full)");
+    expect(text).toContain(
+      "Lean-context hint: context is getting heavy. If this is a new phase, continue from the latest checkpoint instead of dragging the full transcript tail.",
+    );
   });
 
   it("shows plan mode on when the bound conversation has an active plan run", () => {
@@ -433,10 +588,14 @@ describe("formatCodexStatusText", () => {
       hour: "numeric",
       minute: "2-digit",
     }).format(new Date("2026-03-07T17:28:00Z"));
+    const expectedWeeklyReset = new Intl.DateTimeFormat(undefined, {
+      month: "short",
+      day: "numeric",
+    }).format(new Date("2026-03-11T12:34:00Z"));
 
     expect(text).toContain(`Rate limits timezone: ${getCodexStatusTimeZoneLabel()}`);
     expect(text).toContain(`5h limit: 89% left (resets ${expectedFiveHourReset})`);
-    expect(text).toContain("Weekly limit: 80% left (resets Mar 11)");
+    expect(text).toContain(`Weekly limit: 80% left (resets ${expectedWeeklyReset})`);
     expect(text).not.toContain("Jan 21");
   });
 });
