@@ -611,8 +611,64 @@ describe("Discord controller flows", () => {
     }));
   });
 
-  it("shows a project picker for /cas_resume --new without args", async () => {
+  it("starts a new thread in the default workspace for /cas_resume --new without args", async () => {
+    const { controller, clientMock } = await createControllerHarness();
+    const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));
+
+    const reply = await controller.handleCommand(
+      "cas_resume",
+      buildTelegramCommandContext({
+        args: "--new",
+        commandBody: "/cas_resume --new",
+        requestConversationBinding,
+      }),
+    );
+
+    expect(reply).toEqual({});
+    expect(clientMock.startThread).toHaveBeenCalledWith({
+      profile: "default",
+      sessionKey: undefined,
+      workspaceDir: "/repo/openclaw",
+      model: undefined,
+    });
+    expect(requestConversationBinding).toHaveBeenCalledWith(
+      expect.objectContaining({
+        summary: expect.stringContaining("Bind this conversation to Codex thread"),
+      }),
+    );
+  });
+
+  it("treats /cas_new as /cas_resume --new --yolo", async () => {
+    const { controller, clientMock } = await createControllerHarness();
+    const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));
+
+    const reply = await controller.handleCommand(
+      "cas_new",
+      buildTelegramCommandContext({
+        args: "",
+        commandBody: "/cas_new",
+        requestConversationBinding,
+      }),
+    );
+
+    expect(reply).toEqual({});
+    expect(clientMock.startThread).toHaveBeenCalledWith({
+      profile: "full-access",
+      sessionKey: undefined,
+      workspaceDir: "/repo/openclaw",
+      model: undefined,
+    });
+    expect(requestConversationBinding).toHaveBeenCalledWith(
+      expect.objectContaining({
+        summary: expect.stringContaining("Bind this conversation to Codex thread"),
+      }),
+    );
+  });
+
+  it("falls back to the project picker for /cas_resume --new when no default workspace exists", async () => {
     const { controller } = await createControllerHarness();
+    (controller as any).settings.defaultWorkspaceDir = undefined;
+    (controller as any).serviceWorkspaceDir = undefined;
 
     const reply = await controller.handleCommand(
       "cas_resume",
@@ -626,13 +682,9 @@ describe("Discord controller flows", () => {
     const buttons = (reply.channelData as any)?.telegram?.buttons;
     expect(buttons?.[0]?.[0]?.text).toContain("openclaw");
     expect(buttons?.flat().some((button: { text: string }) => button.text === "Recent Threads")).toBe(true);
-    const callbackData = buttons?.[0]?.[0]?.callback_data as string;
-    const token = callbackData.split(":").pop() ?? "";
-    const callback = (controller as any).store.getCallback(token);
-    expect(callback?.kind).toBe("start-new-thread");
   });
 
-  it("collapses matching worktrees to one project root in the /cas_resume --new picker", async () => {
+  it("collapses matching worktrees to one project root in the /cas_resume --new --projects picker", async () => {
     const { controller } = await createControllerHarness();
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-worktree-picker-"));
     const canonicalWorkspaceDir = path.join(tempRoot, "github", "openclaw");
@@ -668,8 +720,8 @@ describe("Discord controller flows", () => {
     const reply = await controller.handleCommand(
       "cas_resume",
       buildTelegramCommandContext({
-        args: "--new",
-        commandBody: "/cas_resume --new",
+        args: "--new --projects",
+        commandBody: "/cas_resume --new --projects",
       }),
     );
 
@@ -684,7 +736,7 @@ describe("Discord controller flows", () => {
     }));
   });
 
-  it("ignores removed worktree history when the project root still exists in the /cas_resume --new picker", async () => {
+  it("ignores removed worktree history when the project root still exists in the /cas_resume --new --projects picker", async () => {
     const { controller } = await createControllerHarness();
     const canonicalWorkspaceParent = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-root-"));
     const canonicalWorkspaceDir = path.join(canonicalWorkspaceParent, "openclaw");
@@ -717,8 +769,8 @@ describe("Discord controller flows", () => {
     const reply = await controller.handleCommand(
       "cas_resume",
       buildTelegramCommandContext({
-        args: "--new",
-        commandBody: "/cas_resume --new",
+        args: "--new --projects",
+        commandBody: "/cas_resume --new --projects",
       }),
     );
 

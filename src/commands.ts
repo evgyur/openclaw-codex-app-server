@@ -1,5 +1,6 @@
 export const COMMANDS = [
   ["cas_resume", "Resume or create a Codex thread, with optional model, fast mode, and permissions overrides."],
+  ["cas_new", "Start a new Codex thread in Full Access mode using the default workspace."],
   ["cas_detach", "Detach this conversation from the current Codex thread."],
   ["cas_status", "Show Codex status and controls, or apply model, fast mode, and permissions overrides."],
   ["cas_task", "Show or update the cockpit task card for the current Codex binding."],

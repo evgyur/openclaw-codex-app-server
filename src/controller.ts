@@ -2613,6 +2613,18 @@ export class CodexPluginController {
           pendingBind,
           hydratedBinding?.pendingBind,
         );
+      case "cas_new": {
+        const newArgs = ["--new", "--yolo", args].filter(Boolean).join(" ");
+        return await this.handleJoinCommand(
+          conversation,
+          binding,
+          newArgs,
+          ctx.channel,
+          ctx,
+          pendingBind,
+          hydratedBinding?.pendingBind,
+        );
+      }
       case "cas_detach":
         if (!conversation) {
           return { text: "This command needs a Telegram or Discord conversation." };
@@ -2688,7 +2700,7 @@ export class CodexPluginController {
     if (!conversation) {
       return { text: "This command needs a Telegram or Discord conversation." };
     }
-    if (parsed.listProjects || !parsed.query) {
+    if (parsed.listProjects) {
       const picker = await this.renderProjectPicker(conversation, binding, parsed, 0, "start-new-thread");
       if (isDiscordChannel(channel) && picker.buttons) {
         try {
@@ -5678,7 +5690,7 @@ export class CodexPluginController {
     }
     const query = parsed.query.trim();
     if (!query) {
-      return null;
+      return this.settings.defaultWorkspaceDir?.trim() || this.serviceWorkspaceDir?.trim() || null;
     }
     if (
       query.startsWith("~") ||

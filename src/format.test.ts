@@ -243,6 +243,41 @@ describe("formatCodexStatusText", () => {
     );
   });
 
+  it("nudges fresh continuation from the latest checkpoint when context is already heavy", () => {
+    const text = formatCodexStatusText({
+      bindingActive: true,
+      threadState: {
+        threadId: "thread-123",
+        threadName: "Chip cockpit prod slice",
+        model: "gpt-5.4",
+        modelProvider: "openai",
+        cwd: "/repo/openclaw",
+      },
+      projectFolder: "/repo/openclaw",
+      worktreeFolder: "/repo/openclaw",
+      contextUsage: {
+        totalTokens: 201_000,
+        contextWindow: 258_000,
+      },
+      rateLimits: [],
+      taskState: {
+        goal: "Ship the prod-safe cockpit task card",
+        stage: "verifying",
+        checkpoint: {
+          summary: "Plugin built and staged for live deploy",
+          nextAction: "Copy extension to intel64 runtime and rerun /cas_status",
+          savedAt: new Date("2026-04-06T12:26:00.000Z").getTime(),
+        },
+        updatedAt: new Date("2026-04-06T12:28:00.000Z").getTime(),
+      },
+    });
+
+    expect(text).toContain("Context usage: 201k / 258k tokens used (78% full)");
+    expect(text).toContain(
+      "Lean-context hint: context is getting heavy. If this is a new phase, continue from the latest checkpoint instead of dragging the full transcript tail.",
+    );
+  });
+
   it("falls back to the bound thread title when status has no live thread name", () => {
     const text = formatCodexStatusText({
       bindingActive: true,
@@ -377,41 +412,6 @@ describe("formatCodexStatusText", () => {
     expect(text).toContain("Checkpoint: Plugin built and staged for live deploy");
     expect(text).toContain("Checkpoint next: Copy extension to intel64 runtime and rerun /cas_status");
     expect(text).toContain("Last heartbeat: 2m ago");
-  });
-
-  it("nudges fresh continuation from the latest checkpoint when context is already heavy", () => {
-    const text = formatCodexStatusText({
-      bindingActive: true,
-      threadState: {
-        threadId: "thread-123",
-        threadName: "Chip cockpit prod slice",
-        model: "gpt-5.4",
-        modelProvider: "openai",
-        cwd: "/repo/openclaw",
-      },
-      projectFolder: "/repo/openclaw",
-      worktreeFolder: "/repo/openclaw",
-      contextUsage: {
-        totalTokens: 201_000,
-        contextWindow: 258_000,
-      },
-      rateLimits: [],
-      taskState: {
-        goal: "Ship the prod-safe cockpit task card",
-        stage: "verifying",
-        checkpoint: {
-          summary: "Plugin built and staged for live deploy",
-          nextAction: "Copy extension to intel64 runtime and rerun /cas_status",
-          savedAt: new Date("2026-04-06T12:26:00.000Z").getTime(),
-        },
-        updatedAt: new Date("2026-04-06T12:28:00.000Z").getTime(),
-      },
-    });
-
-    expect(text).toContain("Context usage: 201k / 258k tokens used (78% full)");
-    expect(text).toContain(
-      "Lean-context hint: context is getting heavy. If this is a new phase, continue from the latest checkpoint instead of dragging the full transcript tail.",
-    );
   });
 
   it("shows plan mode on when the bound conversation has an active plan run", () => {
