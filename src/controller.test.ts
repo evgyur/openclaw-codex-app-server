@@ -5318,6 +5318,96 @@ describe("Discord controller flows", () => {
     }
   });
 
+  it("runs startup recovery only once when start() is called concurrently", async () => {
+    const harness = createApiMock();
+    const store = new PluginStateStore(harness.stateDir);
+    await store.load();
+    await store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: TEST_TELEGRAM_PEER_ID,
+      },
+      sessionKey: buildConversationSessionKey({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: TEST_TELEGRAM_PEER_ID,
+      }),
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      taskState: {
+        stage: "executing",
+        goal: "Resume a single interrupted task",
+        nextAction: "Wait for Codex to finish the current turn",
+        lastHeartbeatAt: Date.now() - 1_000,
+        updatedAt: Date.now() - 1_000,
+      },
+      updatedAt: Date.now() - 1_000,
+    });
+
+    let releaseProbe: (() => void) | undefined;
+    const probeGate = new Promise<void>((resolve) => {
+      releaseProbe = resolve;
+    });
+    const controller = new CodexPluginController(harness.api);
+    const clientMock = {
+      hasProfile: vi.fn((profile: string) => profile === "default" || profile === "full-access"),
+      logStartupProbe: vi.fn(async () => {
+        await probeGate;
+      }),
+      close: vi.fn(async () => undefined),
+      listModels: vi.fn(async () => [{ id: "openai/gpt-5.4", current: true }]),
+      readThreadState: vi.fn(async () => ({
+        threadId: "thread-1",
+        threadName: "Recovered Thread",
+        model: "openai/gpt-5.4",
+        cwd: "/repo/openclaw",
+        serviceTier: "default",
+        approvalPolicy: "on-request",
+        sandbox: "workspace-write",
+      })),
+      readThreadContext: vi.fn(async () => ({
+        lastUserMessage: "resume this",
+        lastAssistantMessage: undefined,
+      })),
+      readAccount: vi.fn(async () => ({
+        email: "test@example.com",
+        planType: "pro",
+        type: "chatgpt",
+      })),
+      readRateLimits: vi.fn(async () => []),
+      startTurn: vi.fn(() => ({
+        result: new Promise(() => {}),
+        getThreadId: () => "thread-1",
+        queueMessage: vi.fn(async () => false),
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      })),
+    };
+    (controller as any).client = clientMock;
+    (controller as any).readThreadHasChanges = vi.fn(async () => false);
+
+    const firstStart = controller.start();
+    const secondStart = controller.start();
+    await Promise.resolve();
+    releaseProbe?.();
+    await Promise.all([firstStart, secondStart]);
+
+    expect(clientMock.logStartupProbe).toHaveBeenCalledTimes(1);
+    expect(clientMock.startTurn).toHaveBeenCalledTimes(1);
+    const sentTexts = harness.sendMessageTelegram.mock.calls.flatMap((call) => {
+      const [, text] = call as unknown as [unknown, unknown];
+      return typeof text === "string" ? [text] : [];
+    });
+    expect(
+      sentTexts.filter(
+        (text) => text === "Gateway restarted while Codex was working. Resuming the task from the saved checkpoint.",
+      ),
+    ).toHaveLength(1);
+  });
+
   it("does not resend the same questionnaire state when plan mode repeats the same pending input", async () => {
     const harness = await createControllerHarness();
     const { controller, sendMessageTelegram } = harness;

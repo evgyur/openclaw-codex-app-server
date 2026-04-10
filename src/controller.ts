@@ -1984,6 +1984,7 @@ export class CodexPluginController {
   private serviceWorkspaceDir?: string;
   private lastRuntimeConfig?: unknown;
   private started = false;
+  private startPromise: Promise<void> | null = null;
 
   constructor(private readonly api: OpenClawPluginApi) {
     this.settings = resolvePluginSettings(this.api.pluginConfig);
@@ -2008,15 +2009,29 @@ export class CodexPluginController {
     if (this.started) {
       return;
     }
-    await this.store.load();
-    await this.client.logStartupProbe().catch(() => undefined);
-    this.started = true;
-    await this.recoverInterruptedTurnsOnStartup().catch((error) => {
-      this.api.logger.warn(`codex startup recovery failed: ${String(error)}`);
-    });
+    if (this.startPromise) {
+      await this.startPromise;
+      return;
+    }
+    this.startPromise = (async () => {
+      await this.store.load();
+      await this.client.logStartupProbe().catch(() => undefined);
+      this.started = true;
+      await this.recoverInterruptedTurnsOnStartup().catch((error) => {
+        this.api.logger.warn(`codex startup recovery failed: ${String(error)}`);
+      });
+    })();
+    try {
+      await this.startPromise;
+    } finally {
+      this.startPromise = null;
+    }
   }
 
   async stop(): Promise<void> {
+    if (this.startPromise) {
+      await this.startPromise.catch(() => undefined);
+    }
     if (!this.started) {
       return;
     }
