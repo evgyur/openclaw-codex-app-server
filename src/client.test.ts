@@ -1,6 +1,41 @@
 import { describe, expect, it, vi } from "vitest";
 import { __testing, CodexAppServerClient } from "./client.js";
 
+describe("buildCodexChildEnv", () => {
+  it("strips OpenAI gateway env vars for OpenClaw-managed codex children", () => {
+    expect(
+      __testing.buildCodexChildEnv({
+        OPENCLAW_SERVICE_MARKER: "openclaw",
+        OPENAI_API_KEY: "sk-test",
+        OPENAI_API_KEYS: "sk-a,sk-b",
+        OPENAI_BASE_URL: "https://example.invalid/v1",
+        CODEX_HOME: "/home/chip/.openclaw/codex-home",
+        PATH: "/usr/bin",
+      }),
+    ).toEqual({
+      OPENCLAW_SERVICE_MARKER: "openclaw",
+      CODEX_HOME: "/home/chip/.openclaw/codex-home",
+      PATH: "/usr/bin",
+    });
+  });
+
+  it("preserves env vars outside an OpenClaw service context", () => {
+    expect(
+      __testing.buildCodexChildEnv({
+        OPENAI_API_KEY: "sk-test",
+        OPENAI_API_KEYS: "sk-a,sk-b",
+        OPENAI_BASE_URL: "https://example.invalid/v1",
+        PATH: "/usr/bin",
+      }),
+    ).toEqual({
+      OPENAI_API_KEY: "sk-test",
+      OPENAI_API_KEYS: "sk-a,sk-b",
+      OPENAI_BASE_URL: "https://example.invalid/v1",
+      PATH: "/usr/bin",
+    });
+  });
+});
+
 describe("buildTurnStartPayloads", () => {
   it("uses the canonical v2 turn/start payload for normal turns", () => {
     expect(
@@ -231,7 +266,7 @@ describe("CodexAppServerClient.setThreadModel", () => {
         error: vi.fn(),
       },
     );
-    (client as any).ensureConnected = vi.fn(async () => ({
+    const ensureConnected = vi.fn(async () => ({
       client: {
         connect: vi.fn(),
         close: vi.fn(),
@@ -242,6 +277,7 @@ describe("CodexAppServerClient.setThreadModel", () => {
       },
       initializeResult: {},
     }));
+    (client as any).ensureConnected = ensureConnected;
 
     const state = await client.setThreadModel({
       sessionKey: "session-123",
@@ -258,6 +294,7 @@ describe("CodexAppServerClient.setThreadModel", () => {
       },
       1_000,
     );
+    expect(ensureConnected).toHaveBeenCalledWith("session-123");
     expect(state.cwd).toBe("/repo/original");
   });
 });
@@ -284,7 +321,7 @@ describe("CodexAppServerClient.setThreadPermissions", () => {
         error: vi.fn(),
       },
     );
-    (client as any).ensureConnected = vi.fn(async () => ({
+    const ensureConnected = vi.fn(async () => ({
       client: {
         connect: vi.fn(),
         close: vi.fn(),
@@ -295,6 +332,7 @@ describe("CodexAppServerClient.setThreadPermissions", () => {
       },
       initializeResult: {},
     }));
+    (client as any).ensureConnected = ensureConnected;
 
     const state = await client.setThreadPermissions({
       sessionKey: "session-123",
@@ -313,6 +351,7 @@ describe("CodexAppServerClient.setThreadPermissions", () => {
       },
       1_000,
     );
+    expect(ensureConnected).toHaveBeenCalledWith("session-123");
     expect(state.approvalPolicy).toBe("never");
     expect(state.sandbox).toBe("danger-full-access");
   });
@@ -351,7 +390,7 @@ describe("CodexAppServerClient.startReview", () => {
         error: vi.fn(),
       },
     );
-    (client as any).ensureConnected = vi.fn(async () => ({
+    const ensureConnected = vi.fn(async () => ({
       client: {
         connect: vi.fn(),
         close: vi.fn(),
@@ -362,6 +401,7 @@ describe("CodexAppServerClient.startReview", () => {
       },
       initializeResult: {},
     }));
+    (client as any).ensureConnected = ensureConnected;
 
     client.startReview({
       sessionKey: "session-123",
@@ -378,6 +418,7 @@ describe("CodexAppServerClient.startReview", () => {
 
     await new Promise((resolve) => setTimeout(resolve, 0));
 
+    expect(ensureConnected).toHaveBeenCalledWith("session-123");
     expect(request).toHaveBeenCalledWith(
       "thread/resume",
       {
@@ -400,6 +441,168 @@ describe("CodexAppServerClient.startReview", () => {
       },
       1_000,
     );
+  });
+});
+
+describe("CodexAppServerClient.startTurn", () => {
+  it("uses the session-scoped app-server connection when starting a turn", async () => {
+    const request = vi.fn(async (method: string) => {
+      if (method === "thread/start") {
+        return {
+          threadId: "thread-123",
+          model: "gpt-5.4",
+        };
+      }
+      if (method === "turn/start") {
+        return {
+          threadId: "thread-123",
+          runId: "turn-123",
+        };
+      }
+      return {};
+    });
+    const client = new CodexAppServerClient(
+      {
+        enabled: true,
+        transport: "stdio",
+        command: "codex",
+        args: [],
+        requestTimeoutMs: 1_000,
+      },
+      {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      },
+    );
+    const ensureConnected = vi.fn(async () => ({
+      client: {
+        connect: vi.fn(),
+        close: vi.fn(),
+        notify: vi.fn(),
+        request,
+        setNotificationHandler: vi.fn(),
+        setRequestHandler: vi.fn(),
+      },
+      initializeResult: {},
+    }));
+    (client as any).ensureConnected = ensureConnected;
+
+    const run = client.startTurn({
+      sessionKey: "session-abc",
+      workspaceDir: "/repo/openclaw",
+      prompt: "Ship it",
+      runId: "run-1",
+    });
+
+    await (client as any).dispatchNotification("turn/completed", {
+      threadId: "thread-123",
+      runId: "turn-123",
+    });
+    await expect(run.result).resolves.toEqual(
+      expect.objectContaining({
+        threadId: "thread-123",
+      }),
+    );
+    expect(ensureConnected).toHaveBeenCalledWith("session-abc");
+    expect(request).toHaveBeenCalledWith(
+      "turn/start",
+      {
+        threadId: "thread-123",
+        input: [{ type: "text", text: "Ship it" }],
+      },
+      1_000,
+    );
+  });
+
+  it("does not call thread/resume before the first turn on a freshly created thread", async () => {
+    const request = vi.fn(async (method: string, params: Record<string, unknown>) => {
+      if (method === "thread/start") {
+        return {
+          threadId: "thread-123",
+          model: "gpt-5.4",
+        };
+      }
+      if (method === "thread/resume") {
+        throw new Error(`unexpected thread/resume ${JSON.stringify(params)}`);
+      }
+      if (method === "turn/start") {
+        return {
+          threadId: "thread-123",
+          runId: "turn-123",
+        };
+      }
+      return {};
+    });
+    const client = new CodexAppServerClient(
+      {
+        enabled: true,
+        transport: "stdio",
+        command: "codex",
+        args: [],
+        requestTimeoutMs: 1_000,
+      },
+      {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      },
+    );
+    (client as any).ensureConnected = vi.fn(async () => ({
+      client: {
+        connect: vi.fn(),
+        close: vi.fn(),
+        notify: vi.fn(),
+        request,
+        setNotificationHandler: vi.fn(),
+        setRequestHandler: vi.fn(),
+      },
+      initializeResult: {},
+    }));
+
+    const run = client.startTurn({
+      sessionKey: "session-abc",
+      workspaceDir: "/repo/openclaw",
+      prompt: "Ship it",
+      runId: "run-1",
+      model: "gpt-5.4",
+      serviceTier: "fast",
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+    });
+
+    await vi.waitFor(() => {
+      expect(request).toHaveBeenCalledWith(
+        "turn/start",
+        expect.objectContaining({
+          threadId: "thread-123",
+          model: "gpt-5.4",
+          serviceTier: "fast",
+        }),
+        1_000,
+      );
+    });
+    await (client as any).dispatchNotification("turn/completed", {
+      threadId: "thread-123",
+      runId: "turn-123",
+    });
+    await expect(run.result).resolves.toEqual(
+      expect.objectContaining({
+        threadId: "thread-123",
+      }),
+    );
+    expect(request).toHaveBeenCalledWith(
+      "turn/start",
+      expect.objectContaining({
+        threadId: "thread-123",
+        model: "gpt-5.4",
+        serviceTier: "fast",
+      }),
+      1_000,
+    );
+    expect(request.mock.calls.map((call) => call[0])).not.toContain("thread/resume");
   });
 });
 

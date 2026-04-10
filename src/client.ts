@@ -82,6 +82,17 @@ const TURN_STEER_METHODS = ["turn/steer"] as const;
 const TURN_INTERRUPT_METHODS = ["turn/interrupt"] as const;
 const execFileAsync = promisify(execFile);
 
+function buildCodexChildEnv(baseEnv: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env = { ...baseEnv };
+  if (!env.OPENCLAW_SERVICE_MARKER?.trim()) {
+    return env;
+  }
+  delete env.OPENAI_API_KEY;
+  delete env.OPENAI_API_KEYS;
+  delete env.OPENAI_BASE_URL;
+  return env;
+}
+
 type StartupProbeInfo = {
   transport: PluginSettings["transport"];
   command?: string;
@@ -660,7 +671,7 @@ class StdioJsonRpcClient implements JsonRpcClient {
     }
     const child = spawn(this.command, ["app-server", ...this.args], {
       stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
+      env: buildCodexChildEnv(),
     });
     if (!child.stdin || !child.stdout || !child.stderr) {
       throw new Error("codex app server stdio pipes unavailable");
@@ -900,7 +911,10 @@ async function probeStdioVersion(settings: PluginSettings): Promise<{
     const { stdout, stderr } = await execFileAsync(
       commandPath,
       [...settings.args, "--version"],
-      { timeout: Math.min(settings.requestTimeoutMs, 10_000) },
+      {
+        timeout: Math.min(settings.requestTimeoutMs, 10_000),
+        env: buildCodexChildEnv(),
+      },
     );
     const combined = `${stdout}\n${stderr}`
       .split(/\r?\n/)
@@ -2499,13 +2513,14 @@ function buildFullAccessPluginSettings(settings: PluginSettings): PluginSettings
 }
 
 export class CodexAppServerClient {
-  private connectionPromise:
-    | Promise<{
-        client: JsonRpcClient;
-        initializeResult: unknown;
-      }>
-    | undefined;
-  private startupProbePromise: Promise<void> | undefined;
+  private readonly connectionPromises = new Map<
+    string,
+    Promise<{
+      client: JsonRpcClient;
+      initializeResult: unknown;
+    }>
+  >();
+  private readonly startupProbePromises = new Map<string, Promise<void>>();
   private readonly notificationListeners = new Set<JsonRpcNotificationHandler>();
   private readonly requestListeners = new Set<RequestListener>();
 
@@ -2514,8 +2529,20 @@ export class CodexAppServerClient {
     private readonly logger: PluginLogger,
   ) {}
 
-  private clearConnectionState(): void {
-    this.connectionPromise = undefined;
+  private buildConnectionCacheKey(sessionKey?: string): string {
+    const trimmed = sessionKey?.trim();
+    return trimmed ? `session:${trimmed}` : "session:<default>";
+  }
+
+  private clearConnectionState(sessionKey?: string): void {
+    if (sessionKey === undefined) {
+      this.connectionPromises.clear();
+      this.startupProbePromises.clear();
+      return;
+    }
+    const key = this.buildConnectionCacheKey(sessionKey);
+    this.connectionPromises.delete(key);
+    this.startupProbePromises.delete(key);
   }
 
   private async dispatchNotification(method: string, params: unknown): Promise<void> {
@@ -2552,12 +2579,14 @@ export class CodexAppServerClient {
     };
   }
 
-  private async getConnection(): Promise<{
+  private async getConnection(sessionKey?: string): Promise<{
     client: JsonRpcClient;
     initializeResult: unknown;
   }> {
-    if (this.connectionPromise) {
-      return await this.connectionPromise;
+    const cacheKey = this.buildConnectionCacheKey(sessionKey);
+    const existing = this.connectionPromises.get(cacheKey);
+    if (existing) {
+      return await existing;
     }
 
     let connectionPromise:
@@ -2567,9 +2596,9 @@ export class CodexAppServerClient {
         }>
       | undefined;
     const handleClose = () => {
-      if (this.connectionPromise === connectionPromise) {
+      if (this.connectionPromises.get(cacheKey) === connectionPromise) {
         this.logger.debug("codex app server transport closed");
-        this.clearConnectionState();
+        this.clearConnectionState(sessionKey);
       }
     };
     const client = createJsonRpcClient(this.settings, this.logger, handleClose);
@@ -2582,21 +2611,21 @@ export class CodexAppServerClient {
       });
       return { client, initializeResult };
     })().catch(async (error) => {
-      if (this.connectionPromise === connectionPromise) {
-        this.clearConnectionState();
+      if (this.connectionPromises.get(cacheKey) === connectionPromise) {
+        this.clearConnectionState(sessionKey);
       }
       await client.close().catch(() => undefined);
       throw error;
     });
-    this.connectionPromise = connectionPromise;
+    this.connectionPromises.set(cacheKey, connectionPromise);
     return await connectionPromise;
   }
 
-  private async ensureConnected(): Promise<{
+  private async ensureConnected(sessionKey?: string): Promise<{
     client: JsonRpcClient;
     initializeResult: unknown;
   }> {
-    return await this.getConnection();
+    return await this.getConnection(sessionKey);
   }
 
   private async withClient<T>(
@@ -2607,7 +2636,7 @@ export class CodexAppServerClient {
       initializeResult: unknown;
     }) => Promise<T>,
   ): Promise<T> {
-    const connection = await this.ensureConnected();
+    const connection = await this.ensureConnected(params.sessionKey);
     try {
       return await callback({
         client: connection.client,
@@ -2623,8 +2652,10 @@ export class CodexAppServerClient {
   }
 
   async logStartupProbe(params: { sessionKey?: string } = {}): Promise<void> {
-    if (this.startupProbePromise) {
-      return await this.startupProbePromise;
+    const cacheKey = this.buildConnectionCacheKey(params.sessionKey);
+    const existing = this.startupProbePromises.get(cacheKey);
+    if (existing) {
+      return await existing;
     }
     const base: StartupProbeInfo = {
       transport: this.settings.transport,
@@ -2633,7 +2664,7 @@ export class CodexAppServerClient {
     };
     const stdioProbe =
       this.settings.transport === "stdio" ? await probeStdioVersion(this.settings) : {};
-    const probePromise = this.ensureConnected()
+    const probePromise = this.ensureConnected(params.sessionKey)
       .then(async ({ initializeResult }) => {
         const info = extractStartupProbeInfo(initializeResult, {
           ...base,
@@ -2642,21 +2673,21 @@ export class CodexAppServerClient {
         this.logger.info(`codex startup probe ${formatStartupProbeLog(info)}`);
       })
       .catch((error) => {
-        this.startupProbePromise = undefined;
+        this.startupProbePromises.delete(cacheKey);
         const message = error instanceof Error ? error.message : String(error);
         this.logger.warn(
           `codex startup probe failed transport=${this.settings.transport}${this.settings.transport === "stdio" ? ` command=${this.settings.command}` : ""}: ${message}`,
         );
       });
-    this.startupProbePromise = probePromise;
+    this.startupProbePromises.set(cacheKey, probePromise);
     await probePromise;
   }
 
   async close(): Promise<void> {
-    const connectionPromise = this.connectionPromise;
+    const connectionPromises = [...this.connectionPromises.values()];
     this.clearConnectionState();
-    const connection = await connectionPromise?.catch(() => undefined);
-    await connection?.client.close().catch(() => undefined);
+    const connections = await Promise.all(connectionPromises.map((entry) => entry.catch(() => undefined)));
+    await Promise.all(connections.map((connection) => connection?.client.close().catch(() => undefined)));
   }
 
   async listThreads(params: {
@@ -2919,7 +2950,7 @@ export class CodexAppServerClient {
     threadId: string;
     onProgress?: (progress: CompactProgress) => Promise<void> | void;
   }): Promise<CompactResult> {
-    const connectionPromise = this.ensureConnected();
+    const connectionPromise = this.ensureConnected(params.sessionKey);
     let latestUsage: ContextUsageSnapshot | undefined;
     let compactionItemId = "";
     let compactionCompleted = false;
@@ -3083,7 +3114,7 @@ export class CodexAppServerClient {
       };
     });
 
-    const connectionPromise = this.ensureConnected();
+    const connectionPromise = this.ensureConnected(params.sessionKey);
     const getClient = async () => (await connectionPromise).client;
 
     const handleResult = (async () => {
@@ -3402,7 +3433,7 @@ export class CodexAppServerClient {
       };
     });
 
-    const connectionPromise = this.ensureConnected();
+    const connectionPromise = this.ensureConnected(params.sessionKey);
     const getClient = async () => (await connectionPromise).client;
 
     const removeNotificationListener = this.addNotificationListener((method, notificationParams) => {
@@ -3619,23 +3650,6 @@ export class CodexAppServerClient {
           this.logger.debug(
             `codex turn thread created run=${params.runId} thread=${threadId} model=${threadModel || "<none>"} reasoningEffort=${threadReasoningEffort || "<none>"}`,
           );
-          if (params.serviceTier || params.approvalPolicy || params.sandbox) {
-            const resumed = await requestWithFallbacks({
-              client,
-              methods: ["thread/resume"],
-              payloads: buildThreadResumePayloads({
-                threadId,
-                serviceTier: params.serviceTier,
-                approvalPolicy: params.approvalPolicy,
-                sandbox: params.sandbox,
-              }),
-              timeoutMs: this.settings.requestTimeoutMs,
-            });
-            const resumedState = extractThreadState(resumed);
-            threadModel = resumedState.model?.trim() || threadModel;
-            threadReasoningEffort =
-              resumedState.reasoningEffort?.trim() || threadReasoningEffort;
-          }
         } else {
           const resumed = await requestWithFallbacks({
             client,
@@ -3995,6 +4009,7 @@ export class CodexAppServerModeClient {
 }
 
 export const __testing = {
+  buildCodexChildEnv,
   buildThreadResumePayloads,
   buildTurnStartPayloads,
   buildTurnSteerPayloads,

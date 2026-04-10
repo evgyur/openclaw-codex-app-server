@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi, PluginCommandContext, ReplyPayload } from "openclaw/plugin-sdk";
 import { CodexAppServerClient } from "./client.js";
 import { CodexPluginController } from "./controller.js";
-import { buildConversationKey } from "./state.js";
+import { buildConversationKey, buildConversationSessionKey } from "./state.js";
 
 const TEST_TELEGRAM_PEER_ID = "telegram-user-1";
 const DISCORD_SDK_OVERRIDE_KEY = "__OPENCLAW_CODEX_APP_SERVER_TEST_DISCORD_SDK__";
@@ -611,7 +611,7 @@ describe("Discord controller flows", () => {
     }));
   });
 
-  it("starts a new thread in the default workspace for /cas_resume --new without args", async () => {
+  it("starts a new thread directly for /cas_resume --new without args in the default workspace", async () => {
     const { controller, clientMock } = await createControllerHarness();
     const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));
 
@@ -638,15 +638,15 @@ describe("Discord controller flows", () => {
     );
   });
 
-  it("treats /cas_new as /cas_resume --new --yolo", async () => {
+  it("starts a new full-access thread directly for /cas_resume --new --yolo", async () => {
     const { controller, clientMock } = await createControllerHarness();
     const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));
 
     const reply = await controller.handleCommand(
-      "cas_new",
+      "cas_resume",
       buildTelegramCommandContext({
-        args: "",
-        commandBody: "/cas_new",
+        args: "--new --yolo",
+        commandBody: "/cas_resume --new --yolo",
         requestConversationBinding,
       }),
     );
@@ -665,26 +665,7 @@ describe("Discord controller flows", () => {
     );
   });
 
-  it("falls back to the project picker for /cas_resume --new when no default workspace exists", async () => {
-    const { controller } = await createControllerHarness();
-    (controller as any).settings.defaultWorkspaceDir = undefined;
-    (controller as any).serviceWorkspaceDir = undefined;
-
-    const reply = await controller.handleCommand(
-      "cas_resume",
-      buildTelegramCommandContext({
-        args: "--new",
-        commandBody: "/cas_resume --new",
-      }),
-    );
-
-    expect(reply.text).toContain("Choose a project for the new Codex thread");
-    const buttons = (reply.channelData as any)?.telegram?.buttons;
-    expect(buttons?.[0]?.[0]?.text).toContain("openclaw");
-    expect(buttons?.flat().some((button: { text: string }) => button.text === "Recent Threads")).toBe(true);
-  });
-
-  it("collapses matching worktrees to one project root in the /cas_resume --new --projects picker", async () => {
+  it("collapses matching worktrees to one project root in the /cas_resume --new picker", async () => {
     const { controller } = await createControllerHarness();
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-worktree-picker-"));
     const canonicalWorkspaceDir = path.join(tempRoot, "github", "openclaw");
@@ -711,7 +692,8 @@ describe("Discord controller flows", () => {
       },
     ]);
     (controller as any).resolveProjectFolder = vi.fn(async (workspaceDir?: string) => {
-      if (!workspaceDir?.includes("/.codex/worktrees/")) {
+      const normalized = workspaceDir?.replace(/\\/g, "/");
+      if (!normalized?.includes("/.codex/worktrees/")) {
         return workspaceDir;
       }
       return canonicalWorkspaceDir;
@@ -736,7 +718,7 @@ describe("Discord controller flows", () => {
     }));
   });
 
-  it("ignores removed worktree history when the project root still exists in the /cas_resume --new --projects picker", async () => {
+  it("ignores removed worktree history when the project root still exists in the /cas_resume --new picker", async () => {
     const { controller } = await createControllerHarness();
     const canonicalWorkspaceParent = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-root-"));
     const canonicalWorkspaceDir = path.join(canonicalWorkspaceParent, "openclaw");
@@ -1764,6 +1746,46 @@ describe("Discord controller flows", () => {
     expect(reply.text).toContain(`Plugin version: ${TEST_PLUGIN_VERSION}`);
     expect(reply.text).toContain("Project folder: /repo/discrawl");
     expect(reply.text).toContain("Thread: thread-1");
+  });
+
+  it("rejects cas_status overrides when the topic is only locally known", async () => {
+    const { controller, clientMock } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      preferences: {
+        preferredModel: "openai/gpt-5.4",
+        preferredServiceTier: null,
+        updatedAt: Date.now(),
+      },
+      updatedAt: Date.now(),
+    });
+
+    const reply = await controller.handleCommand(
+      "cas_status",
+      buildTelegramCommandContext({
+        args: "--model gpt-5.4 --fast --yolo",
+        commandBody: "/cas_status --model gpt-5.4 --fast --yolo",
+        getCurrentConversationBinding: vi.fn(async () => null),
+      }),
+    );
+
+    expect(reply.text).toBe("Run /cas_resume before changing status settings for this topic.");
+    const binding = (controller as any).store.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123",
+    });
+    expect(binding?.permissionsMode).toBeUndefined();
+    expect(binding?.preferences?.preferredServiceTier).toBeNull();
+    expect(clientMock.setThreadModel).not.toHaveBeenCalled();
+    expect(clientMock.setThreadServiceTier).not.toHaveBeenCalled();
   });
 
   it("does not hydrate a denied pending bind into cas_status", async () => {
@@ -3356,6 +3378,32 @@ describe("Discord controller flows", () => {
     expect(binding?.preferences?.preferredModel).toBe("gpt-5.3-codex-spark");
   });
 
+  it("routes /cas_new through the new-thread full-access path", async () => {
+    const { controller, clientMock } = await createControllerHarness();
+    const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));
+
+    const reply = await controller.handleCommand(
+      "cas_new",
+      buildTelegramCommandContext({
+        commandBody: "/cas_new",
+        requestConversationBinding,
+      }),
+    );
+
+    expect(reply).toEqual({});
+    expect(clientMock.startThread).toHaveBeenCalledWith({
+      profile: "full-access",
+      sessionKey: undefined,
+      workspaceDir: "/repo/openclaw",
+      model: undefined,
+    });
+    expect(requestConversationBinding).toHaveBeenCalledWith(
+      expect.objectContaining({
+        summary: expect.stringContaining("Bind this conversation to Codex thread"),
+      }),
+    );
+  });
+
   it("sends the Telegram bind approval prompt only once for resume callbacks", async () => {
     const { controller } = await createControllerHarness();
     const callback = await (controller as any).store.putCallback({
@@ -4442,6 +4490,58 @@ describe("Discord controller flows", () => {
     );
   });
 
+  it("falls back to direct Telegram Bot API text delivery when the runtime send path says chat not found", async () => {
+    const { api, sendMessageTelegram } = createApiMock();
+    const controller = new CodexPluginController(api);
+    await controller.start();
+    sendMessageTelegram.mockRejectedValue(
+      new Error("Telegram send failed: chat not found (chat_id=-1003701370893)"),
+    );
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        ok: true,
+        result: {
+          message_id: 9001,
+          chat: {
+            id: -1003701370893,
+          },
+        },
+      }),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const sent = await (controller as any).sendReply(
+      {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "-1003701370893:topic:3",
+        parentConversationId: "-1003701370893",
+        threadId: 3,
+      },
+      {
+        text: "Recovered via direct Bot API fallback.",
+      },
+    );
+
+    expect(sent).toBe(true);
+    expect(sendMessageTelegram).toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://api.telegram.org/bottelegram-token/sendMessage",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          chat_id: "-1003701370893",
+          text: "Recovered via direct Bot API fallback.",
+          message_thread_id: 3,
+        }),
+      }),
+    );
+    expect(api.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("retrying via direct Bot API fallback"),
+    );
+  });
+
   it("passes trusted local media roots when sending a Discord plan attachment", async () => {
     const { controller, sendMessageDiscord, stateDir } = await createControllerHarness();
     const attachmentPath = path.join(stateDir, "tmp", "plan.md");
@@ -4598,6 +4698,273 @@ describe("Discord controller flows", () => {
     expect(startTurn).toHaveBeenCalled();
     expect(api.logger.warn).toHaveBeenCalledWith(
       expect.stringContaining("reached an active run but was not accepted; restarting"),
+    );
+  });
+
+  it("retries a bound turn on a fresh thread when the stored thread is missing", async () => {
+    const { controller, sendMessageTelegram, api, clientMock } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "openclaw-codex-app-server:thread:thread-stale",
+      threadId: "thread-stale",
+      workspaceDir: "/repo/openclaw",
+      taskState: {
+        goal: "Keep the long-lived cockpit flow alive",
+        stage: "executing",
+        nextAction: "Wait for Codex output",
+        verification: {
+          status: "unverified",
+          updatedAt: Date.now(),
+        },
+        updatedAt: Date.now(),
+      },
+      updatedAt: Date.now(),
+    });
+    (clientMock.readThreadState as any).mockImplementation(async (params: { threadId: string }) => ({
+      threadId: params.threadId,
+      threadName: params.threadId === "thread-2" ? "Recovered Thread" : "Stale Thread",
+      model: "openai/gpt-5.4",
+      cwd: "/repo/openclaw",
+      serviceTier: "default",
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+    }));
+    const startTurn = vi
+      .fn()
+      .mockImplementationOnce(() => ({
+        result: Promise.reject(
+          new Error("codex app server rpc error (-32600): thread not found: thread-stale"),
+        ),
+        getThreadId: () => "thread-stale",
+        queueMessage: vi.fn(async () => false),
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      }))
+      .mockImplementation(() => ({
+        result: Promise.resolve({
+          threadId: "thread-2",
+          text: "Recovered on a fresh thread.",
+        }),
+        getThreadId: () => "thread-2",
+        queueMessage: vi.fn(async () => false),
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      }));
+    (controller as any).client.startTurn = startTurn;
+
+    await (controller as any).startTurn({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      binding: (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      }),
+      workspaceDir: "/repo/openclaw",
+      prompt: "continue",
+      reason: "command",
+    });
+    await flushAsyncWork();
+    await flushAsyncWork();
+    await vi.waitFor(() => {
+      expect(startTurn).toHaveBeenCalledTimes(2);
+    });
+
+    expect(startTurn).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        existingThreadId: "thread-stale",
+        sessionKey: "openclaw-codex-app-server:thread:thread-stale",
+      }),
+    );
+    expect(startTurn).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        existingThreadId: undefined,
+        sessionKey: "openclaw-codex-app-server:thread:thread-stale",
+      }),
+    );
+    expect((controller as any).store.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123",
+    })).toEqual(
+      expect.objectContaining({
+        sessionKey: "openclaw-codex-app-server:thread:thread-stale",
+        threadId: "thread-2",
+        threadTitle: "Recovered Thread",
+        taskState: expect.objectContaining({
+          goal: "Keep the long-lived cockpit flow alive",
+        }),
+      }),
+    );
+    expect(sendMessageTelegram.mock.calls.some((call) => String(call[1]).includes("Codex failed:"))).toBe(
+      false,
+    );
+    expect(api.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("retrying without the stale thread binding"),
+    );
+  });
+
+  it("retries a fresh turn when the newly created thread loses its rollout", async () => {
+    const { controller, sendMessageTelegram, api, clientMock } = await createControllerHarness();
+    const conversation = {
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123",
+    } as const;
+    const expectedSessionKey = buildConversationSessionKey(conversation);
+    (clientMock.readThreadState as any).mockImplementation(async (params: { threadId: string }) => ({
+      threadId: params.threadId,
+      threadName: params.threadId === "thread-2" ? "Recovered Thread" : "Fresh Thread",
+      model: "openai/gpt-5.4",
+      cwd: "/repo/openclaw",
+      serviceTier: "default",
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+    }));
+    const startTurn = vi
+      .fn()
+      .mockImplementationOnce(() => ({
+        result: Promise.reject(
+          new Error("codex app server rpc error (-32600): no rollout found for thread id thread-new"),
+        ),
+        getThreadId: () => "thread-new",
+        queueMessage: vi.fn(async () => false),
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      }))
+      .mockImplementation(() => ({
+        result: Promise.resolve({
+          threadId: "thread-2",
+          text: "Recovered on a fresh thread.",
+        }),
+        getThreadId: () => "thread-2",
+        queueMessage: vi.fn(async () => false),
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      }));
+    (controller as any).client.startTurn = startTurn;
+
+    await (controller as any).startTurn({
+      conversation,
+      binding: null,
+      workspaceDir: "/repo/openclaw",
+      prompt: "Ship the long-lived cockpit flow",
+      reason: "command",
+    });
+    await flushAsyncWork();
+    await flushAsyncWork();
+    await vi.waitFor(() => {
+      expect(startTurn).toHaveBeenCalledTimes(2);
+    });
+
+    expect(startTurn).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        existingThreadId: undefined,
+        sessionKey: expectedSessionKey,
+      }),
+    );
+    expect(startTurn).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        existingThreadId: undefined,
+        sessionKey: expectedSessionKey,
+      }),
+    );
+    expect((controller as any).store.getBinding(conversation)).toEqual(
+      expect.objectContaining({
+        sessionKey: expectedSessionKey,
+        threadId: "thread-2",
+        threadTitle: "Recovered Thread",
+      }),
+    );
+    expect(sendMessageTelegram.mock.calls.some((call) => String(call[1]).includes("Codex failed:"))).toBe(
+      false,
+    );
+    expect(api.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("staleThread=thread-new"),
+    );
+  });
+
+  it("uses the runtime conversation session key when a local binding is missing one", async () => {
+    const { controller, api, clientMock } = await createControllerHarness();
+    const conversation = {
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123",
+      parentConversationId: "group-1",
+    } as const;
+    const targetSessionKey = "plugin-binding:openclaw-codex-app-server:test-session";
+    (api.runtime.channel.bindings.resolveByConversation as any).mockReturnValue({
+      targetSessionKey,
+    });
+    (clientMock.readThreadState as any).mockResolvedValue({
+      threadId: "thread-1",
+      threadName: "Recovered Thread",
+      model: "openai/gpt-5.4",
+      cwd: "/repo/openclaw",
+      serviceTier: "default",
+      approvalPolicy: "never",
+      sandbox: "danger-full-access",
+    });
+    const startTurn = vi.fn(() => ({
+      result: Promise.resolve({
+        threadId: "thread-1",
+        text: "OK",
+      }),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => false),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    }));
+    (controller as any).client.startTurn = startTurn;
+
+    await (controller as any).startTurn({
+      conversation,
+      binding: {
+        conversation,
+        threadId: "thread-stale",
+        workspaceDir: "/repo/openclaw",
+        permissionsMode: "full-access",
+        updatedAt: Date.now(),
+      } as any,
+      workspaceDir: "/repo/openclaw",
+      prompt: "continue",
+      reason: "command",
+    });
+    await flushAsyncWork();
+    await flushAsyncWork();
+
+    expect(startTurn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionKey: targetSessionKey,
+        existingThreadId: "thread-stale",
+      }),
+    );
+    expect((controller as any).store.getBinding(conversation)).toEqual(
+      expect.objectContaining({
+        sessionKey: targetSessionKey,
+        threadId: "thread-1",
+      }),
     );
   });
 
@@ -5285,11 +5652,7 @@ describe("Discord controller flows", () => {
     });
 
     await flushAsyncWork();
-    expect(sendMessageTelegram).toHaveBeenCalledWith(
-      TEST_TELEGRAM_PEER_ID,
-      "Cancelled the Codex approval request.",
-      expect.anything(),
-    );
+    await flushAsyncWork();
     expect(clientMock.readAccount).not.toHaveBeenCalled();
   });
 
@@ -7874,5 +8237,26 @@ describe("Discord controller flows", () => {
       expect(binding?.taskState?.checkpoint?.summary).toBe("Turn interrupted before completion");
       expect(binding?.taskState?.checkpoint?.nextAction).toBe("Restart or steer the task");
     });
+  });
+
+  it("falls back to TELEGRAM_BOT_TOKEN when runtime config is unavailable", async () => {
+    const { api, resolveTelegramToken } = createApiMock();
+    resolveTelegramToken.mockImplementation(() => undefined as any);
+    const controller = new CodexPluginController(api);
+    await controller.start();
+    const previous = process.env.TELEGRAM_BOT_TOKEN;
+    process.env.TELEGRAM_BOT_TOKEN = "env-telegram-token";
+    try {
+      (controller as any).getOpenClawConfig = vi.fn(() => undefined);
+      await expect((controller as any).resolveTelegramBotToken("default")).resolves.toBe(
+        "env-telegram-token",
+      );
+    } finally {
+      if (previous === undefined) {
+        delete process.env.TELEGRAM_BOT_TOKEN;
+      } else {
+        process.env.TELEGRAM_BOT_TOKEN = previous;
+      }
+    }
   });
 });

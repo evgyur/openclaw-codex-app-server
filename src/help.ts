@@ -36,13 +36,13 @@ export const COMMAND_HELP: Record<CommandName, CommandHelpEntry> = {
       "/cas_resume --cwd ~/github/openclaw release-fix",
       "/cas_resume --sync thread-1",
     ],
-    notes: "Use --new with no filter to start in the default workspace, or add --projects / --cwd when you want to choose explicitly. Full Access depends on the current Codex Desktop profiles.",
+    notes: "Use --new with no filter to start immediately in the resolved workspace for this conversation, or add --projects / --cwd when you want to choose explicitly. Full Access depends on the current Codex Desktop profiles.",
   },
   cas_new: {
     summary: COMMAND_SUMMARY.cas_new,
-    usage: "/cas_new",
-    examples: ["/cas_new"],
-    notes: "Alias for `/cas_resume --new --yolo`. Starts a fresh Codex thread in the default workspace with Full Access.",
+    usage: "/cas_new [same overrides as /cas_resume]",
+    examples: ["/cas_new", "/cas_new --model openai/gpt-5.4"],
+    notes: "Alias for `/cas_resume --new --yolo`. Starts a fresh Codex thread immediately in the resolved workspace with Full Access.",
   },
   cas_detach: {
     summary: COMMAND_SUMMARY.cas_detach,

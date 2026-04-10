@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { existsSync, promises as fs } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import type {
   PluginConversationBindingResolvedEvent,
@@ -75,7 +75,7 @@ import {
 } from "./pending-input.js";
 import {
   buildConversationKey,
-  buildPluginSessionKey,
+  buildConversationSessionKey,
   PluginStateStore,
 } from "./state.js";
 import {
@@ -99,7 +99,6 @@ import {
   type StoredPendingBind,
   type StoredPendingRequest,
 } from "./types.js";
-import { loadOpenClawCompatModule } from "./openclaw-sdk-compat.js";
 
 type ActiveRunRecord = {
   conversation: ConversationTarget;
@@ -181,25 +180,31 @@ function getDiscordSdkCompatOverride(): DiscordSdkCompat | undefined {
   return root[DISCORD_SDK_OVERRIDE_KEY];
 }
 
+function resolveOpenClawDistModuleUrl(relativePath: string): string | undefined {
+  try {
+    const entryPath = require.resolve("openclaw");
+    return pathToFileURL(path.join(path.dirname(entryPath), relativePath)).href;
+  } catch {
+    return undefined;
+  }
+}
+
 async function loadDiscordSdkCompat(): Promise<DiscordSdkCompat> {
+  const apiModuleUrl = resolveOpenClawDistModuleUrl("extensions/discord/api.js");
+  const runtimeModuleUrl = resolveOpenClawDistModuleUrl("extensions/discord/runtime-api.js");
+  if (!apiModuleUrl || !runtimeModuleUrl) {
+    throw new Error("Failed to resolve OpenClaw dist Discord helper modules.");
+  }
   const [apiModule, runtimeModule] = await Promise.all([
-    loadOpenClawCompatModule<{ buildDiscordComponentMessage: DiscordSdkCompat["buildDiscordComponentMessage"]; resolveDiscordAccount: DiscordSdkCompat["resolveDiscordAccount"] }>({
-      specifier: "openclaw/plugin-sdk/discord",
-      fallbackRelativePath: "dist/plugin-sdk/discord.js",
-      label: "discord",
-    }),
-    loadOpenClawCompatModule<{ editDiscordComponentMessage: DiscordSdkCompat["editDiscordComponentMessage"]; registerBuiltDiscordComponentMessage: DiscordSdkCompat["registerBuiltDiscordComponentMessage"] }>({
-      specifier: "openclaw/plugin-sdk/discord-runtime-api",
-      fallbackRelativePath: "dist/extensions/discord/runtime-api.js",
-      label: "discord-runtime",
-    }),
+    import(apiModuleUrl),
+    import(runtimeModuleUrl),
   ]);
   return {
     buildDiscordComponentMessage: apiModule.buildDiscordComponentMessage,
     editDiscordComponentMessage: runtimeModule.editDiscordComponentMessage,
     registerBuiltDiscordComponentMessage: runtimeModule.registerBuiltDiscordComponentMessage,
     resolveDiscordAccount: apiModule.resolveDiscordAccount,
-  } as DiscordSdkCompat;
+  } as unknown as DiscordSdkCompat;
 }
 
 let discordSdkCompatPromise: Promise<DiscordSdkCompat> | null = null;
@@ -1374,8 +1379,19 @@ function normalizeTaskText(value: string | undefined): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
+function normalizePromptForTaskGoal(prompt: string): string {
+  return prompt.replace(/\s+/g, " ").trim();
+}
+
+function isContinuationPrompt(prompt: string): boolean {
+  const normalized = normalizePromptForTaskGoal(prompt).toLowerCase();
+  return /^(continue|continue please|go on|keep going|proceed|retry|давай|сделай|погнали|продолжай|дальше|ну давай|да сделай)[.!?]*$/.test(
+    normalized,
+  );
+}
+
 function deriveTaskGoalFromPrompt(prompt: string): string | undefined {
-  const normalized = prompt.replace(/\s+/g, " ").trim();
+  const normalized = normalizePromptForTaskGoal(prompt);
   if (!normalized) {
     return undefined;
   }
@@ -2608,18 +2624,16 @@ export class CodexPluginController {
           pendingBind,
           hydratedBinding?.pendingBind,
         );
-      case "cas_new": {
-        const newArgs = ["--new", "--yolo", args].filter(Boolean).join(" ");
+      case "cas_new":
         return await this.handleJoinCommand(
           conversation,
           binding,
-          newArgs,
+          ["--new", "--yolo", args].filter(Boolean).join(" "),
           ctx.channel,
           ctx,
           pendingBind,
           hydratedBinding?.pendingBind,
         );
-      }
       case "cas_detach":
         if (!conversation) {
           return { text: "This command needs a Telegram or Discord conversation." };
@@ -2965,6 +2979,9 @@ export class CodexPluginController {
       if (!binding || !conversation) {
         return { text: "Bind this conversation to Codex before changing status settings." };
       }
+      if (!bindingActive) {
+        return { text: "Run /cas_resume before changing status settings for this topic." };
+      }
       const { state: currentThreadState, effectiveState } = await this.readEffectiveThreadState(binding);
       const effectiveModel =
         parsed.requestedModel?.trim() ||
@@ -3138,8 +3155,9 @@ export class CodexPluginController {
     }
     const derivedGoal = deriveTaskGoalFromPrompt(params.prompt);
     const existingVerification = params.binding.taskState?.verification;
+    const existingGoal = params.binding.taskState?.goal;
     return await this.upsertTaskState(params.binding, {
-      goal: derivedGoal ?? params.binding.taskState?.goal,
+      goal: existingGoal && isContinuationPrompt(params.prompt) ? existingGoal : derivedGoal ?? existingGoal,
       stage: params.stage,
       nextAction: params.nextAction,
       latestEvidence: null,
@@ -4615,16 +4633,20 @@ export class CodexPluginController {
     input?: readonly CodexTurnInputItem[];
     reason: "command" | "inbound" | "plan";
     collaborationMode?: CollaborationMode;
+    freshThread?: boolean;
+    missingThreadRetryAttempted?: boolean;
   }): Promise<void> {
     const key = buildConversationKey(params.conversation);
     let binding = params.binding;
-    binding =
-      (await this.seedAutomaticTaskState({
-        binding,
-        prompt: params.prompt,
-        stage: "executing",
-        nextAction: "Wait for Codex output",
-      })) ?? binding;
+    if (!params.missingThreadRetryAttempted) {
+      binding =
+        (await this.seedAutomaticTaskState({
+          binding,
+          prompt: params.prompt,
+          stage: "executing",
+          nextAction: "Wait for Codex output",
+        })) ?? binding;
+    }
     binding = (await this.touchTaskHeartbeat(binding)) ?? binding;
     const profile = this.getPermissionsMode(binding);
     const existing = this.activeRuns.get(key);
@@ -4683,6 +4705,8 @@ export class CodexPluginController {
         keepaliveInterval = null;
       }
     };
+    let retryFreshThreadBinding = false;
+    let retryBinding: StoredBinding | null = null;
     this.api.logger.debug?.(
       `codex turn starting app-server run ${this.formatConversationForLog(params.conversation)} typing=${typing ? "yes" : "no"} session=${binding?.sessionKey ?? "<none>"} existingThread=${binding?.threadId ?? "<none>"} profile=${profile} mode=${params.collaborationMode?.mode ?? "default"}`,
     );
@@ -4691,14 +4715,16 @@ export class CodexPluginController {
       binding,
       this.settings.defaultModel,
     );
+    const sessionKey = this.resolveConversationSessionKey(params.conversation, binding);
+    const existingThreadId = params.freshThread ? undefined : binding?.threadId;
     const run = this.client.startTurn({
       profile,
-      sessionKey: binding?.sessionKey,
+      sessionKey,
       workspaceDir: params.workspaceDir,
       prompt: params.prompt,
       input: params.input,
       runId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-      existingThreadId: binding?.threadId,
+      existingThreadId,
       model: desired.model,
       reasoningEffort: desired.reasoningEffort,
       serviceTier: desired.serviceTier ?? undefined,
@@ -4790,11 +4816,12 @@ export class CodexPluginController {
           const state = await this.client
             .readThreadState({
               profile,
-              sessionKey: binding?.sessionKey,
+              sessionKey,
               threadId,
             })
             .catch(() => null);
           const nextBinding = await this.bindConversation(params.conversation, {
+            sessionKey,
             threadId,
             workspaceDir: state?.cwd || params.workspaceDir,
             threadTitle: state?.threadName,
@@ -4825,7 +4852,7 @@ export class CodexPluginController {
         const completionText =
           result.terminalStatus === "failed"
             ? await this.describeTurnFailure({
-            sessionKey: params.binding?.sessionKey ?? binding?.sessionKey,
+            sessionKey,
             profile,
             error: result.terminalError?.message ?? "turn failed",
             terminalError: result.terminalError,
@@ -4835,7 +4862,7 @@ export class CodexPluginController {
                 !result.text?.trim() &&
                 !result.planArtifact?.markdown
               ? await this.describeEmptyTurnCompletion({
-                sessionKey: params.binding?.sessionKey ?? binding?.sessionKey,
+                sessionKey,
                 profile,
                 threadId: result.threadId ?? params.binding?.threadId ?? binding?.threadId,
               })
@@ -4853,6 +4880,21 @@ export class CodexPluginController {
         await this.sendText(params.conversation, completionText);
       })
       .catch(async (error) => {
+        const staleThreadId =
+          (typeof binding?.threadId === "string" && binding.threadId.trim()) ||
+          (typeof run.getThreadId === "function" ? run.getThreadId()?.trim() : "");
+        if (
+          isMissingThreadError(error) &&
+          staleThreadId &&
+          !params.missingThreadRetryAttempted
+        ) {
+          this.api.logger.warn(
+            `codex turn hit stale thread binding ${this.formatConversationForLog(params.conversation)} staleThread=${staleThreadId}; retrying without the stale thread binding`,
+          );
+          retryFreshThreadBinding = true;
+          retryBinding = binding ?? this.store.getBinding(params.conversation) ?? null;
+          return;
+        }
         const message = error instanceof Error ? error.message : String(error);
         this.api.logger.warn(
           `codex turn failed ${this.formatConversationForLog(params.conversation)}: ${message}`,
@@ -4860,7 +4902,7 @@ export class CodexPluginController {
         await this.sendText(
           params.conversation,
           await this.describeTurnFailure({
-            sessionKey: params.binding?.sessionKey ?? binding?.sessionKey,
+            sessionKey,
             profile,
             error,
           }),
@@ -4879,6 +4921,14 @@ export class CodexPluginController {
         this.api.logger.debug?.(
           `codex turn cleaned up ${this.formatConversationForLog(params.conversation)}`,
         );
+        if (retryFreshThreadBinding) {
+          await this.startTurn({
+            ...params,
+            binding: retryBinding,
+            freshThread: true,
+            missingThreadRetryAttempted: true,
+          });
+        }
       });
   }
 
@@ -5685,7 +5735,11 @@ export class CodexPluginController {
     }
     const query = parsed.query.trim();
     if (!query) {
-      return this.settings.defaultWorkspaceDir?.trim() || this.serviceWorkspaceDir?.trim() || null;
+      return resolveWorkspaceDir({
+        bindingWorkspaceDir: binding?.workspaceDir,
+        configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
+        serviceWorkspaceDir: this.serviceWorkspaceDir,
+      });
     }
     if (
       query.startsWith("~") ||
@@ -6399,7 +6453,7 @@ export class CodexPluginController {
       const threadState = await this.client
         .readThreadState({
           profile,
-          sessionKey: buildPluginSessionKey(callback.threadId),
+          sessionKey: this.resolveConversationSessionKey(callback.conversation, currentBinding),
           threadId: callback.threadId,
         })
         .catch(() => undefined);
@@ -7489,9 +7543,30 @@ export class CodexPluginController {
     }
   }
 
+  private getResolvedRuntimeSessionKey(conversation: ConversationTarget): string | undefined {
+    const targetSessionKey = this.api.runtime.channel.bindings
+      ?.resolveByConversation?.(conversation)
+      ?.targetSessionKey?.trim();
+    return targetSessionKey || undefined;
+  }
+
+  private resolveConversationSessionKey(
+    conversation: ConversationTarget,
+    binding?: Partial<StoredBinding> | null,
+  ): string {
+    const storedSessionKey = binding?.sessionKey?.trim();
+    if (storedSessionKey) {
+      return storedSessionKey;
+    }
+    return (
+      this.getResolvedRuntimeSessionKey(conversation) ?? buildConversationSessionKey(conversation)
+    );
+  }
+
   private async bindConversation(
     conversation: ConversationTarget,
     params: {
+      sessionKey?: string;
       threadId: string;
       workspaceDir: string;
       threadTitle?: string;
@@ -7500,8 +7575,12 @@ export class CodexPluginController {
       preferences?: ConversationPreferences;
     },
   ): Promise<StoredBinding> {
-    const sessionKey = buildPluginSessionKey(params.threadId);
     const existing = this.store.getBinding(conversation);
+    const sessionKey =
+      params.sessionKey?.trim() ||
+      existing?.sessionKey?.trim() ||
+      this.getResolvedRuntimeSessionKey(conversation) ||
+      buildConversationSessionKey(conversation);
     const record: StoredBinding = {
       conversation: {
         channel: conversation.channel,
@@ -7961,57 +8040,99 @@ export class CodexPluginController {
       `codex outbound send start ${this.formatConversationForLog(conversation)} textChars=${text.length} media=${hasMedia ? "yes" : "no"} buttons=${payload.buttons?.length ?? 0} preview="${summarizeTextForLog(text, 80)}"`,
     );
     if (isTelegramChannel(conversation.channel)) {
-      const outbound = await this.loadTelegramOutboundAdapter();
-      const mediaLocalRoots = this.resolveReplyMediaLocalRoots(payload.mediaUrl);
-      const limit = this.api.runtime.channel.text.resolveTextChunkLimit(
-        undefined,
-        "telegram",
-        conversation.accountId,
-        { fallbackLimit: 4000 },
-      );
-      const chunks = text
-        ? this.api.runtime.channel.text.chunkText(text, limit).filter(Boolean)
-        : [];
-      let delivered: DeliveredMessageRef | null = null;
-      if (hasMedia) {
-        const result =
-          chunks.length <= 1 && payload.buttons && outbound?.sendPayload
-            ? await outbound.sendPayload({
-                cfg: this.getOpenClawConfig(),
-                to: conversation.parentConversationId ?? conversation.conversationId,
-                accountId: conversation.accountId,
-                threadId: conversation.threadId,
-                mediaLocalRoots,
-                payload: {
-                  text: chunks[0] ?? text,
-                  mediaUrl: payload.mediaUrl,
-                  channelData: {
-                    telegram: {
-                      buttons: payload.buttons,
+      try {
+        const outbound = await this.loadTelegramOutboundAdapter();
+        const mediaLocalRoots = this.resolveReplyMediaLocalRoots(payload.mediaUrl);
+        const limit = this.api.runtime.channel.text.resolveTextChunkLimit(
+          undefined,
+          "telegram",
+          conversation.accountId,
+          { fallbackLimit: 4000 },
+        );
+        const chunks = text
+          ? this.api.runtime.channel.text.chunkText(text, limit).filter(Boolean)
+          : [];
+        let delivered: DeliveredMessageRef | null = null;
+        if (hasMedia) {
+          const result =
+            chunks.length <= 1 && payload.buttons && outbound?.sendPayload
+              ? await outbound.sendPayload({
+                  cfg: this.getOpenClawConfig(),
+                  to: conversation.parentConversationId ?? conversation.conversationId,
+                  accountId: conversation.accountId,
+                  threadId: conversation.threadId,
+                  mediaLocalRoots,
+                  payload: {
+                    text: chunks[0] ?? text,
+                    mediaUrl: payload.mediaUrl,
+                    channelData: {
+                      telegram: {
+                        buttons: payload.buttons,
+                      },
                     },
                   },
-                },
-              })
-            : await this.sendTelegramMediaChunk(outbound, conversation, chunks[0] ?? text, {
-                mediaUrl: payload.mediaUrl,
-                mediaLocalRoots,
-                buttons: chunks.length <= 1 ? payload.buttons : undefined,
-              });
-        delivered = {
-          provider: "telegram",
-          messageId: result.messageId,
-          chatId:
-            typeof result.chatId === "string"
-              ? result.chatId
-              : conversation.parentConversationId ?? conversation.conversationId,
-        };
-        for (let index = 1; index < chunks.length; index += 1) {
-          const chunk = chunks[index];
+                })
+              : await this.sendTelegramMediaChunk(outbound, conversation, chunks[0] ?? text, {
+                  mediaUrl: payload.mediaUrl,
+                  mediaLocalRoots,
+                  buttons: chunks.length <= 1 ? payload.buttons : undefined,
+                });
+          delivered = {
+            provider: "telegram",
+            messageId: result.messageId,
+            chatId:
+              typeof result.chatId === "string"
+                ? result.chatId
+                : conversation.parentConversationId ?? conversation.conversationId,
+          };
+          for (let index = 1; index < chunks.length; index += 1) {
+            const chunk = chunks[index];
+            if (!chunk) {
+              continue;
+            }
+            const result =
+              index === chunks.length - 1 && payload.buttons && outbound?.sendPayload
+                ? await outbound.sendPayload({
+                    cfg: this.getOpenClawConfig(),
+                    to: conversation.parentConversationId ?? conversation.conversationId,
+                    accountId: conversation.accountId,
+                    threadId: conversation.threadId,
+                    payload: {
+                      text: chunk,
+                      channelData: {
+                        telegram: {
+                          buttons: payload.buttons,
+                        },
+                      },
+                    },
+                  })
+                : await this.sendTelegramTextChunk(outbound, conversation, chunk, {
+                    buttons: index === chunks.length - 1 ? payload.buttons : undefined,
+                  });
+            if (index === chunks.length - 1 || !delivered) {
+              delivered = {
+                provider: "telegram",
+                messageId: result.messageId,
+                chatId:
+                  typeof result.chatId === "string"
+                    ? result.chatId
+                    : conversation.parentConversationId ?? conversation.conversationId,
+              };
+            }
+          }
+          this.api.logger.debug?.(
+            `codex outbound send complete ${this.formatConversationForLog(conversation)} channel=telegram chunks=${Math.max(chunks.length, 1)} media=${hasMedia ? "yes" : "no"}`,
+          );
+          return delivered;
+        }
+        const textChunks = chunks.length > 0 ? chunks : [text];
+        for (let index = 0; index < textChunks.length; index += 1) {
+          const chunk = textChunks[index];
           if (!chunk) {
             continue;
           }
           const result =
-            index === chunks.length - 1 && payload.buttons && outbound?.sendPayload
+            index === textChunks.length - 1 && payload.buttons && outbound?.sendPayload
               ? await outbound.sendPayload({
                   cfg: this.getOpenClawConfig(),
                   to: conversation.parentConversationId ?? conversation.conversationId,
@@ -8027,9 +8148,9 @@ export class CodexPluginController {
                   },
                 })
               : await this.sendTelegramTextChunk(outbound, conversation, chunk, {
-                  buttons: index === chunks.length - 1 ? payload.buttons : undefined,
+                  buttons: index === textChunks.length - 1 ? payload.buttons : undefined,
                 });
-          if (index === chunks.length - 1 || !delivered) {
+          if (!delivered || index === textChunks.length - 1) {
             delivered = {
               provider: "telegram",
               messageId: result.messageId,
@@ -8041,50 +8162,18 @@ export class CodexPluginController {
           }
         }
         this.api.logger.debug?.(
-          `codex outbound send complete ${this.formatConversationForLog(conversation)} channel=telegram chunks=${Math.max(chunks.length, 1)} media=${hasMedia ? "yes" : "no"}`,
+          `codex outbound send complete ${this.formatConversationForLog(conversation)} channel=telegram chunks=${textChunks.length} media=no`,
         );
         return delivered;
-      }
-      const textChunks = chunks.length > 0 ? chunks : [text];
-      for (let index = 0; index < textChunks.length; index += 1) {
-        const chunk = textChunks[index];
-        if (!chunk) {
-          continue;
+      } catch (error) {
+        if (!this.isTelegramChatNotFoundError(error) || !text) {
+          throw error;
         }
-        const result =
-          index === textChunks.length - 1 && payload.buttons && outbound?.sendPayload
-            ? await outbound.sendPayload({
-                cfg: this.getOpenClawConfig(),
-                to: conversation.parentConversationId ?? conversation.conversationId,
-                accountId: conversation.accountId,
-                threadId: conversation.threadId,
-                payload: {
-                  text: chunk,
-                  channelData: {
-                    telegram: {
-                      buttons: payload.buttons,
-                    },
-                  },
-                },
-              })
-            : await this.sendTelegramTextChunk(outbound, conversation, chunk, {
-                buttons: index === textChunks.length - 1 ? payload.buttons : undefined,
-              });
-        if (!delivered || index === textChunks.length - 1) {
-          delivered = {
-            provider: "telegram",
-            messageId: result.messageId,
-            chatId:
-              typeof result.chatId === "string"
-                ? result.chatId
-                : conversation.parentConversationId ?? conversation.conversationId,
-          };
-        }
+        this.api.logger.warn(
+          `codex telegram runtime send failed ${this.formatConversationForLog(conversation)}; retrying via direct Bot API fallback: ${String(error)}`,
+        );
+        return await this.sendTelegramTextViaBotApiFallback(conversation, text);
       }
-      this.api.logger.debug?.(
-        `codex outbound send complete ${this.formatConversationForLog(conversation)} channel=telegram chunks=${textChunks.length} media=no`,
-      );
-      return delivered;
     }
     if (isDiscordChannel(conversation.channel)) {
       const mediaLocalRoots = this.resolveReplyMediaLocalRoots(payload.mediaUrl);
@@ -8209,6 +8298,11 @@ export class CodexPluginController {
 
   private getOpenClawConfig(): unknown {
     return this.lastRuntimeConfig ?? (this.api as OpenClawPluginApi & { config?: unknown }).config;
+  }
+
+  private isTelegramChatNotFoundError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return message.toLowerCase().includes("chat not found");
   }
 
   private async loadTelegramOutboundAdapter(): Promise<TelegramOutboundAdapter | undefined> {
@@ -8422,10 +8516,86 @@ export class CodexPluginController {
     text: string,
     opts?: { buttons?: PluginInteractiveButtons },
   ): Promise<void> {
-    await this.sendReply(conversation, {
-      text,
-      buttons: opts?.buttons,
-    });
+    try {
+      await this.sendReply(conversation, {
+        text,
+        buttons: opts?.buttons,
+      });
+    } catch (error) {
+      if (isTelegramChannel(conversation.channel) && !opts?.buttons && this.isTelegramChatNotFoundError(error)) {
+        try {
+          await this.sendTelegramTextViaBotApiFallback(conversation, text);
+          return;
+        } catch (fallbackError) {
+          this.api.logger.warn(
+            `codex telegram fallback send failed ${this.formatConversationForLog(conversation)}: ${String(fallbackError)}`,
+          );
+        }
+      }
+      this.api.logger.warn(
+        `codex outbound text send failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
+      );
+    }
+  }
+
+  private async sendTelegramTextViaBotApiFallback(
+    conversation: ConversationTarget,
+    text: string,
+  ): Promise<DeliveredMessageRef | null> {
+    const token = await this.resolveTelegramBotToken(conversation.accountId);
+    if (!token) {
+      throw new Error("Telegram Bot API fallback unavailable: missing bot token");
+    }
+    const target = conversation.parentConversationId ?? conversation.conversationId;
+    const limit = this.api.runtime.channel.text.resolveTextChunkLimit(
+      undefined,
+      "telegram",
+      undefined,
+      { fallbackLimit: 4000 },
+    );
+    const chunks = this.api.runtime.channel.text.chunkText(text, limit).filter(Boolean);
+    const textChunks = chunks.length > 0 ? chunks : [text];
+    let delivered: DeliveredMessageRef | null = null;
+    for (const chunk of textChunks) {
+      if (!chunk) {
+        continue;
+      }
+      const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          chat_id: target,
+          text: chunk,
+          ...(conversation.threadId != null ? { message_thread_id: conversation.threadId } : {}),
+        }),
+      });
+      const payload = (await
+        (typeof response.json === "function" ? response.json() : Promise.resolve(undefined))
+          .catch(() => undefined)) as
+        | { ok?: boolean; result?: { message_id?: number; chat?: { id?: number | string } }; description?: string }
+        | undefined;
+      if (!response.ok || !payload?.ok) {
+        throw new Error(
+          `Telegram Bot API fallback failed status=${response.status} description=${payload?.description ?? "<none>"}`,
+        );
+      }
+      delivered = {
+        provider: "telegram",
+        messageId:
+          typeof payload.result?.message_id === "number"
+            ? String(payload.result.message_id)
+            : payload.result?.message_id
+              ? String(payload.result.message_id)
+              : "",
+        chatId:
+          payload.result?.chat?.id != null
+            ? String(payload.result.chat.id)
+            : target,
+      };
+    }
+    return delivered;
   }
 
   private async sendTextWithDeliveryRef(
@@ -8586,7 +8756,8 @@ export class CodexPluginController {
     }
     const cfg = this.getOpenClawConfig();
     if (!cfg) {
-      return undefined;
+      const envToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
+      return envToken || undefined;
     }
     const root = asRecord(cfg);
     const channels = asRecord(root?.channels);
@@ -8601,10 +8772,14 @@ export class CodexPluginController {
       asRecord(accounts?.[normalizedAccountId]) ??
       asRecord(accounts?.[configuredDefaultAccount ?? ""]) ??
       asRecord(accounts?.default);
-    const tokenCandidates = [account?.token, telegram?.token]
+    const tokenCandidates = [account?.token, telegram?.token, telegram?.botToken]
       .map((value) => (typeof value === "string" ? value.trim() : ""))
       .filter(Boolean);
-    return tokenCandidates[0] || undefined;
+    if (tokenCandidates[0]) {
+      return tokenCandidates[0];
+    }
+    const envToken = process.env.TELEGRAM_BOT_TOKEN?.trim();
+    return envToken || undefined;
   }
 
   private async resolveDiscordBotToken(accountId?: string): Promise<string | undefined> {

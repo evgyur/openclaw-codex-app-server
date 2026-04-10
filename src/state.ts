@@ -269,25 +269,6 @@ function normalizeConversationPreferences(
   };
 }
 
-function normalizeCallbackIdentityValue(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map((entry) => normalizeCallbackIdentityValue(entry));
-  }
-  if (!value || typeof value !== "object") {
-    return value;
-  }
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>)
-      .filter(([key]) => key !== "token" && key !== "createdAt" && key !== "expiresAt")
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, entry]) => [key, normalizeCallbackIdentityValue(entry)]),
-  );
-}
-
-function buildCallbackIdentity(entry: CallbackAction): string {
-  return JSON.stringify(normalizeCallbackIdentityValue(entry));
-}
-
 function normalizeSnapshot(value?: Partial<StoreSnapshot>): StoreSnapshot {
   const snapshot = cloneSnapshot(value);
   snapshot.version = STORE_VERSION;
@@ -339,6 +320,7 @@ function normalizeSnapshot(value?: Partial<StoreSnapshot>): StoreSnapshot {
 
 export class PluginStateStore {
   private snapshot = cloneSnapshot();
+  private saveQueue = Promise.resolve();
 
   constructor(private readonly rootDir: string) {}
 
@@ -350,6 +332,35 @@ export class PluginStateStore {
     return path.join(this.dir, "state.json");
   }
 
+  private getTempFilePath(): string {
+    return path.join(
+      this.dir,
+      `state.${process.pid}.${Date.now()}.${crypto.randomBytes(6).toString("hex")}.tmp`,
+    );
+  }
+
+  private getCorruptBackupPath(): string {
+    return path.join(this.dir, `state.corrupt-${Date.now()}.json`);
+  }
+
+  private pruneExpiredAndReport(now = Date.now()): boolean {
+    const before = JSON.stringify(this.snapshot);
+    this.pruneExpired(now);
+    return JSON.stringify(this.snapshot) !== before;
+  }
+
+  private async saveSnapshot(snapshot: StoreSnapshot): Promise<void> {
+    await fs.mkdir(this.dir, { recursive: true });
+    const tempFile = this.getTempFilePath();
+    await fs.writeFile(tempFile, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+    try {
+      await fs.rm(this.filePath, { force: true });
+      await fs.rename(tempFile, this.filePath);
+    } finally {
+      await fs.rm(tempFile, { force: true }).catch(() => undefined);
+    }
+  }
+
   async load(): Promise<void> {
     await fs.mkdir(this.dir, { recursive: true });
     try {
@@ -359,8 +370,16 @@ export class PluginStateStore {
       this.pruneExpired();
       await this.save();
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        throw error;
+      const errorCode = (error as NodeJS.ErrnoException).code;
+      if (errorCode !== "ENOENT") {
+        try {
+          await fs.rename(this.filePath, this.getCorruptBackupPath());
+        } catch {
+          // Preserve the original parse/read error if backup also fails.
+        }
+        this.snapshot = cloneSnapshot();
+        await this.save();
+        return;
       }
       this.snapshot = cloneSnapshot();
       await this.save();
@@ -368,8 +387,9 @@ export class PluginStateStore {
   }
 
   async save(): Promise<void> {
-    await fs.mkdir(this.dir, { recursive: true });
-    await fs.writeFile(this.filePath, `${JSON.stringify(this.snapshot, null, 2)}\n`, "utf8");
+    const snapshot = cloneSnapshot(this.snapshot);
+    this.saveQueue = this.saveQueue.then(() => this.saveSnapshot(snapshot));
+    await this.saveQueue;
   }
 
   pruneExpired(now = Date.now()): void {
@@ -421,6 +441,7 @@ export class PluginStateStore {
   }
 
   getPendingRequestByConversation(target: ConversationTarget): StoredPendingRequest | null {
+    this.pruneExpiredAndReport();
     const key = toConversationKey(target);
     return (
       this.snapshot.pendingRequests.find((entry) => toConversationKey(entry.conversation) === key) ??
@@ -429,6 +450,7 @@ export class PluginStateStore {
   }
 
   getPendingBind(target: ConversationTarget): StoredPendingBind | null {
+    this.pruneExpiredAndReport();
     const key = toConversationKey(target);
     return (
       this.snapshot.pendingBinds.find((entry) => toConversationKey(entry.conversation) === key) ??
@@ -454,6 +476,7 @@ export class PluginStateStore {
   }
 
   getPendingRequestById(requestId: string): StoredPendingRequest | null {
+    this.pruneExpiredAndReport();
     return this.snapshot.pendingRequests.find((entry) => entry.requestId === requestId) ?? null;
   }
 
@@ -728,16 +751,8 @@ export class PluginStateStore {
                       createdAt: now,
                       expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
                     };
-    this.pruneExpired(now);
-    const identity = buildCallbackIdentity(entry);
-    const existing = this.snapshot.callbacks.find(
-      (current) => buildCallbackIdentity(current) === identity,
-    );
-    if (existing && !callback.token) {
-      return existing;
-    }
     this.snapshot.callbacks = this.snapshot.callbacks.filter(
-      (current) => current.token !== entry.token && buildCallbackIdentity(current) !== identity,
+      (current) => current.token !== entry.token,
     );
     this.snapshot.callbacks.push(entry);
     await this.save();
@@ -745,6 +760,7 @@ export class PluginStateStore {
   }
 
   getCallback(token: string): CallbackAction | null {
+    this.pruneExpiredAndReport();
     return this.snapshot.callbacks.find((entry) => entry.token === token) ?? null;
   }
 
@@ -756,6 +772,11 @@ export class PluginStateStore {
 
 export function buildPluginSessionKey(threadId: string): string {
   return `${PLUGIN_ID}:thread:${threadId.trim()}`;
+}
+
+export function buildConversationSessionKey(target: ConversationTarget): string {
+  const hash = crypto.createHash("sha256").update(toConversationKey(target)).digest("hex").slice(0, 24);
+  return `${PLUGIN_ID}:conversation:${hash}`;
 }
 
 export function buildConversationKey(target: ConversationTarget): string {

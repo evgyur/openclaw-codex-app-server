@@ -136,40 +136,6 @@ describe("state store", () => {
     expect(reloaded.getCallback(replyCallback.token)?.kind).toBe("reply-text");
   });
 
-  it("replaces duplicate callbacks and prunes expired entries on put", async () => {
-    const dir = await makeStoreDir();
-    const store = await makeStore(dir);
-    const conversation = {
-      channel: "telegram" as const,
-      accountId: "default",
-      conversationId: "123",
-    };
-
-    const expired = await store.putCallback({
-      kind: "show-model-picker",
-      conversation,
-      ttlMs: -1,
-    });
-    const first = await store.putCallback({
-      kind: "refresh-status",
-      conversation,
-    });
-    const second = await store.putCallback({
-      kind: "refresh-status",
-      conversation,
-    });
-    const reloaded = await makeStore(dir);
-    const snapshot = JSON.parse(await fs.readFile(reloaded.filePath, "utf8")) as {
-      callbacks: Array<{ token: string; kind: string }>;
-    };
-
-    expect(reloaded.getCallback(expired.token)).toBeNull();
-    expect(second.token).toBe(first.token);
-    expect(reloaded.getCallback(first.token)?.kind).toBe("refresh-status");
-    expect(snapshot.callbacks).toHaveLength(1);
-    expect(snapshot.callbacks[0]?.token).toBe(first.token);
-  });
-
   it("removes pending requests and related callbacks", async () => {
     const store = await makeStore();
     await store.upsertPendingRequest({
@@ -214,6 +180,74 @@ describe("state store", () => {
     expect(store.getPendingRequestById("req-1")).toBeNull();
     expect(store.getCallback(callback.token)).toBeNull();
     expect(store.getCallback(questionnaireCallback.token)).toBeNull();
+  });
+
+  it("does not return expired pending requests or callbacks without a reload", async () => {
+    const store = await makeStore();
+    await store.upsertPendingRequest({
+      requestId: "req-expired",
+      conversation: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "chan-1",
+      },
+      threadId: "thread-1",
+      workspaceDir: "/tmp/work",
+      state: {
+        requestId: "req-expired",
+        options: ["yes"],
+        expiresAt: Date.now() - 1_000,
+      },
+      updatedAt: Date.now() - 1_000,
+    });
+    const callback = await store.putCallback({
+      kind: "pending-input",
+      conversation: {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "chan-1",
+      },
+      requestId: "req-expired",
+      actionIndex: 0,
+      ttlMs: 1,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    expect(
+      store.getPendingRequestByConversation({
+        channel: "discord",
+        accountId: "default",
+        conversationId: "chan-1",
+      }),
+    ).toBeNull();
+    expect(store.getPendingRequestById("req-expired")).toBeNull();
+    expect(store.getCallback(callback.token)).toBeNull();
+  });
+
+  it("recovers from a corrupted state file by backing it up and starting clean", async () => {
+    const dir = await makeStoreDir();
+    const stateDir = path.join(dir, "openclaw-codex-app-server");
+    await fs.mkdir(stateDir, { recursive: true });
+    await fs.writeFile(path.join(stateDir, "state.json"), "{not valid json\n", "utf8");
+
+    const store = new PluginStateStore(dir);
+    await expect(store.load()).resolves.toBeUndefined();
+
+    const binding = store.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123",
+    });
+    expect(binding).toBeNull();
+
+    const recovered = await fs.readFile(path.join(stateDir, "state.json"), "utf8");
+    expect(() => JSON.parse(recovered)).not.toThrow();
+
+    const backupEntries = await fs.readdir(stateDir);
+    expect(backupEntries.some((entry) => entry.startsWith("state.corrupt-") && entry.endsWith(".json"))).toBe(
+      true,
+    );
   });
 
   it("clears a pending bind when the binding is finalized", async () => {
