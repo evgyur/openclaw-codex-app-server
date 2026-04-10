@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi, PluginCommandContext, ReplyPayload } from "openclaw/plugin-sdk";
 import { CodexAppServerClient } from "./client.js";
 import { CodexPluginController } from "./controller.js";
-import { buildConversationKey, buildConversationSessionKey } from "./state.js";
+import { PluginStateStore, buildConversationKey, buildConversationSessionKey } from "./state.js";
 
 const TEST_TELEGRAM_PEER_ID = "telegram-user-1";
 const DISCORD_SDK_OVERRIDE_KEY = "__OPENCLAW_CODEX_APP_SERVER_TEST_DISCORD_SDK__";
@@ -5168,6 +5168,9 @@ describe("Discord controller flows", () => {
       await Promise.resolve();
       await vi.advanceTimersByTimeAsync(0);
       await vi.advanceTimersByTimeAsync(12_500);
+      await vi.runOnlyPendingTimersAsync();
+      await Promise.resolve();
+      await Promise.resolve();
 
       const sentTexts = sendMessageTelegram.mock.calls.flatMap((call) => {
         const [, text] = call as unknown as [unknown, unknown];
@@ -5182,6 +5185,131 @@ describe("Discord controller flows", () => {
       resolveResult?.({
         threadId: "thread-1",
         aborted: true,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("recovers a fresh executing task on startup and restarts the turn keepalive cadence", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-10T04:20:00+03:00"));
+    try {
+      const harness = createApiMock();
+      const store = new PluginStateStore(harness.stateDir);
+      await store.load();
+      await store.upsertBinding({
+        conversation: {
+          channel: "telegram",
+          accountId: "default",
+          conversationId: TEST_TELEGRAM_PEER_ID,
+        },
+        sessionKey: buildConversationSessionKey({
+          channel: "telegram",
+          accountId: "default",
+          conversationId: TEST_TELEGRAM_PEER_ID,
+        }),
+        threadId: "thread-1",
+        workspaceDir: "/repo/openclaw",
+        taskState: {
+          stage: "executing",
+          goal: "Finish the cockpit recovery patch",
+          nextAction: "Wait for Codex to finish the current turn",
+          checkpoint: {
+            summary: "Gateway restarted before the turn completed",
+            nextAction: "Resume from the saved checkpoint",
+            savedAt: Date.now() - 20_000,
+          },
+          lastHeartbeatAt: Date.now() - 45_000,
+          updatedAt: Date.now() - 45_000,
+        },
+        updatedAt: Date.now() - 45_000,
+      });
+
+      let resolveResult: ((value: unknown) => void) | undefined;
+      const result = new Promise((resolve) => {
+        resolveResult = resolve;
+      });
+      const controller = new CodexPluginController(harness.api);
+      const clientMock = {
+        hasProfile: vi.fn((profile: string) => profile === "default" || profile === "full-access"),
+        logStartupProbe: vi.fn(async () => undefined),
+        close: vi.fn(async () => undefined),
+        listModels: vi.fn(async () => [{ id: "openai/gpt-5.4", current: true }]),
+        readThreadState: vi.fn(async () => ({
+          threadId: "thread-1",
+          threadName: "Recovered Thread",
+          model: "openai/gpt-5.4",
+          cwd: "/repo/openclaw",
+          serviceTier: "default",
+          approvalPolicy: "on-request",
+          sandbox: "workspace-write",
+        })),
+        readThreadContext: vi.fn(async () => ({
+          lastUserMessage: "resume this",
+          lastAssistantMessage: undefined,
+        })),
+        readAccount: vi.fn(async () => ({
+          email: "test@example.com",
+          planType: "pro",
+          type: "chatgpt",
+        })),
+        readRateLimits: vi.fn(async () => []),
+        startTurn: vi.fn(() => ({
+          result,
+          getThreadId: () => "thread-1",
+          queueMessage: vi.fn(async () => false),
+          interrupt: vi.fn(async () => {}),
+          isAwaitingInput: () => false,
+          submitPendingInput: vi.fn(async () => false),
+          submitPendingInputPayload: vi.fn(async () => false),
+        })),
+      };
+      (controller as any).client = clientMock;
+      (controller as any).readThreadHasChanges = vi.fn(async () => false);
+
+      await controller.start();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect((controller as any).activeRuns.size).toBe(1);
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
+
+      expect(clientMock.startTurn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sessionKey: buildConversationSessionKey({
+            channel: "telegram",
+            accountId: "default",
+            conversationId: TEST_TELEGRAM_PEER_ID,
+          }),
+          existingThreadId: "thread-1",
+          workspaceDir: "/repo/openclaw",
+          prompt: expect.stringContaining("Resume the current Codex task"),
+        }),
+      );
+
+      const sentTextsBeforeKeepalive = harness.sendMessageTelegram.mock.calls.flatMap((call) => {
+        const [, text] = call as unknown as [unknown, unknown];
+        return typeof text === "string" ? [text] : [];
+      });
+      expect(sentTextsBeforeKeepalive).toContain(
+        "Gateway restarted while Codex was working. Resuming the task from the saved checkpoint.",
+      );
+      expect(sentTextsBeforeKeepalive).toContain("Codex is still working...");
+
+      const sentTexts = harness.sendMessageTelegram.mock.calls.flatMap((call) => {
+        const [, text] = call as unknown as [unknown, unknown];
+        return typeof text === "string" ? [text] : [];
+      });
+      expect((harness.api as any).logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("codex recovery keepalive tick failed"),
+      );
+      expect(sentTexts).toContain("Codex is still working...");
+
+      resolveResult?.({
+        threadId: "thread-1",
+        text: "Recovered completion.",
       });
       await Promise.resolve();
       await Promise.resolve();

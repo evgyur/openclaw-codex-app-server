@@ -1136,6 +1136,7 @@ const PLAN_PROGRESS_DELAY_MS = 12_000;
 const REVIEW_PROGRESS_DELAY_MS = 12_000;
 const COMPACT_PROGRESS_DELAY_MS = 12_000;
 const COMPACT_PROGRESS_INTERVAL_MS = 15_000;
+const STARTUP_TASK_RECOVERY_WINDOW_MS = 15 * 60_000;
 const PLAN_INLINE_TEXT_LIMIT = 2600;
 
 function isTransportClosedMessage(error: unknown): boolean {
@@ -2010,6 +2011,9 @@ export class CodexPluginController {
     await this.store.load();
     await this.client.logStartupProbe().catch(() => undefined);
     this.started = true;
+    await this.recoverInterruptedTurnsOnStartup().catch((error) => {
+      this.api.logger.warn(`codex startup recovery failed: ${String(error)}`);
+    });
   }
 
   async stop(): Promise<void> {
@@ -2086,6 +2090,122 @@ export class CodexPluginController {
       `parent=${conversation.parentConversationId ?? "<none>"}`,
       `thread=${conversation.threadId == null ? "<none>" : String(conversation.threadId)}`,
     ].join(" ");
+  }
+
+  private toConversationTarget(ref: ConversationRef): ConversationTarget {
+    const rawRef = asRecord(ref) ?? {};
+    const rawThreadId = rawRef.threadId;
+    if (ref.channel === "telegram") {
+      const normalizedConversationId = normalizeTelegramChatId(ref.conversationId) ?? ref.conversationId;
+      const topicMatch = /^(.*):topic:(\d+)$/.exec(normalizedConversationId);
+      const resolvedThreadId =
+        typeof rawThreadId === "number"
+          ? rawThreadId
+          : typeof rawThreadId === "string" && rawThreadId.trim()
+            ? Number(rawThreadId.trim())
+            : topicMatch?.[2]
+              ? Number(topicMatch[2])
+              : undefined;
+      return {
+        channel: "telegram",
+        accountId: ref.accountId,
+        conversationId: normalizedConversationId,
+        parentConversationId: ref.parentConversationId ?? topicMatch?.[1],
+        threadId: Number.isFinite(resolvedThreadId) ? resolvedThreadId : undefined,
+      };
+    }
+    return {
+      channel: ref.channel,
+      accountId: ref.accountId,
+      conversationId: ref.conversationId,
+      parentConversationId: ref.parentConversationId,
+      threadId:
+        typeof rawThreadId === "number"
+          ? rawThreadId
+          : typeof rawThreadId === "string" && rawThreadId.trim()
+            ? Number(rawThreadId.trim())
+            : undefined,
+    };
+  }
+
+  private shouldRecoverInterruptedTurn(binding: StoredBinding, now = Date.now()): boolean {
+    const lastHeartbeatAt = binding.taskState?.lastHeartbeatAt;
+    return Boolean(
+      binding.threadId.trim() &&
+        binding.workspaceDir.trim() &&
+        binding.taskState?.stage === "executing" &&
+        typeof lastHeartbeatAt === "number" &&
+        now - lastHeartbeatAt <= STARTUP_TASK_RECOVERY_WINDOW_MS,
+    );
+  }
+
+  private async recoverInterruptedTurnsOnStartup(): Promise<void> {
+    const now = Date.now();
+    const bindings = this.store.listBindings();
+    for (const binding of bindings) {
+      if (!this.shouldRecoverInterruptedTurn(binding, now)) {
+        continue;
+      }
+      const conversation = this.toConversationTarget(binding.conversation);
+      if (this.activeRuns.has(buildConversationKey(conversation))) {
+        continue;
+      }
+      if (this.store.getPendingRequestByConversation(conversation)) {
+        continue;
+      }
+      this.api.logger.info?.(
+        `codex startup recovery resuming interrupted turn ${this.formatConversationForLog(conversation)} thread=${binding.threadId}`,
+      );
+      await this.sendText(
+        conversation,
+        "Gateway restarted while Codex was working. Resuming the task from the saved checkpoint.",
+      );
+      await this.startTurn({
+        conversation,
+        binding,
+        workspaceDir: binding.workspaceDir,
+        prompt: buildResumeTaskPrompt(binding.taskState),
+        reason: "command",
+        skipProgressKeepalive: true,
+      });
+      const active = this.activeRuns.get(buildConversationKey(conversation));
+      if (active) {
+        this.startRecoveryTurnKeepalive(conversation, binding, active.handle);
+      }
+    }
+  }
+
+  private startRecoveryTurnKeepalive(
+    conversation: ConversationTarget,
+    initialBinding: StoredBinding,
+    handle: ActiveCodexRun,
+  ): void {
+    const key = buildConversationKey(conversation);
+    let binding = initialBinding;
+    let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
+    const stop = () => {
+      if (keepaliveInterval) {
+        clearInterval(keepaliveInterval);
+        keepaliveInterval = null;
+      }
+    };
+    const tick = async () => {
+      const active = this.activeRuns.get(key);
+      if (!active || active.handle !== handle) {
+        stop();
+        return;
+      }
+      await this.sendText(conversation, "Codex is still working...");
+      binding = (await this.touchTaskHeartbeat(this.store.getBinding(conversation) ?? binding)) ?? binding;
+    };
+    void tick().catch((error) => {
+      this.api.logger.warn(`codex recovery keepalive tick failed: ${String(error)}`);
+    });
+    keepaliveInterval = setInterval(() => {
+      void tick().catch((error) => {
+        this.api.logger.warn(`codex recovery keepalive tick failed: ${String(error)}`);
+      });
+    }, TURN_PROGRESS_INTERVAL_MS);
   }
 
   async handleInboundClaim(event: {
@@ -4635,6 +4755,7 @@ export class CodexPluginController {
     collaborationMode?: CollaborationMode;
     freshThread?: boolean;
     missingThreadRetryAttempted?: boolean;
+    skipProgressKeepalive?: boolean;
   }): Promise<void> {
     const key = buildConversationKey(params.conversation);
     let binding = params.binding;
@@ -4683,18 +4804,21 @@ export class CodexPluginController {
     }
     const typing = await this.startTypingLease(params.conversation);
     let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
-    let progressTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
-      void (async () => {
-        binding = (await this.touchTaskHeartbeat(binding)) ?? binding;
-        await this.sendText(params.conversation, "Codex is still working...");
-      })();
-      keepaliveInterval = setInterval(() => {
+    let progressTimer: ReturnType<typeof setTimeout> | null = null;
+    if (!params.skipProgressKeepalive) {
+      progressTimer = setTimeout(() => {
         void (async () => {
           binding = (await this.touchTaskHeartbeat(binding)) ?? binding;
           await this.sendText(params.conversation, "Codex is still working...");
         })();
-      }, TURN_PROGRESS_INTERVAL_MS);
-    }, TURN_PROGRESS_DELAY_MS);
+        keepaliveInterval = setInterval(() => {
+          void (async () => {
+            binding = (await this.touchTaskHeartbeat(binding)) ?? binding;
+            await this.sendText(params.conversation, "Codex is still working...");
+          })();
+        }, TURN_PROGRESS_INTERVAL_MS);
+      }, TURN_PROGRESS_DELAY_MS);
+    }
     const stopProgressTimer = () => {
       if (progressTimer) {
         clearTimeout(progressTimer);
