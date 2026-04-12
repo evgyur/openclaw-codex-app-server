@@ -1995,6 +1995,7 @@ export class CodexPluginController {
   private lastRuntimeConfig?: unknown;
   private started = false;
   private startPromise: Promise<void> | null = null;
+  private stopping = false;
 
   constructor(private readonly api: OpenClawPluginApi) {
     this.settings = resolvePluginSettings(this.api.pluginConfig);
@@ -2026,6 +2027,7 @@ export class CodexPluginController {
     this.startPromise = (async () => {
       await this.store.load();
       await this.client.logStartupProbe().catch(() => undefined);
+      this.stopping = false;
       this.started = true;
       await this.recoverInterruptedTurnsOnStartup().catch((error) => {
         this.api.logger.warn(`codex startup recovery failed: ${String(error)}`);
@@ -2045,6 +2047,7 @@ export class CodexPluginController {
     if (!this.started) {
       return;
     }
+    this.stopping = true;
     for (const active of this.activeRuns.values()) {
       await active.handle.interrupt().catch(() => undefined);
     }
@@ -4963,6 +4966,12 @@ export class CodexPluginController {
         this.api.logger.debug?.(
           `codex turn interrupted ${this.formatConversationForLog(params.conversation)}`,
         );
+        if (this.stopping) {
+          this.api.logger.debug?.(
+            `codex turn interruption suppressed during controller stop ${this.formatConversationForLog(params.conversation)}`,
+          );
+          return;
+        }
         binding =
           (await this.upsertTaskState((binding ?? this.store.getBinding(params.conversation))!, {
             stage: "blocked",

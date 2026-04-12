@@ -8643,4 +8643,104 @@ describe("Discord controller flows", () => {
       }
     }
   });
+
+  it("does not announce 'Codex stopped.' when controller shutdown interrupts an active run", async () => {
+    const harness = createApiMock();
+    const controller = new CodexPluginController(harness.api);
+    await (controller as any).store.load();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      taskState: {
+        stage: "planned",
+        goal: "Resume the current production task",
+        nextAction: "Continue the current production task",
+        lastHeartbeatAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+      updatedAt: Date.now(),
+    });
+
+    let interrupted: (() => Promise<void>) | undefined;
+    const clientMock = {
+      hasProfile: vi.fn((profile: string) => profile === "default" || profile === "full-access"),
+      logStartupProbe: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+      listModels: vi.fn(async () => [{ id: "openai/gpt-5.4", current: true }]),
+      readThreadState: vi.fn(async () => ({
+        threadId: "thread-1",
+        threadName: "Recovered Thread",
+        model: "openai/gpt-5.4",
+        cwd: "/repo/openclaw",
+        serviceTier: "default",
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+      })),
+      readThreadContext: vi.fn(async () => ({
+        lastUserMessage: "resume this",
+        lastAssistantMessage: undefined,
+      })),
+      readAccount: vi.fn(async () => ({
+        email: "test@example.com",
+        planType: "pro",
+        type: "chatgpt",
+      })),
+      readRateLimits: vi.fn(async () => []),
+      startTurn: vi.fn((params: any) => {
+        interrupted = async () => {
+          await params.onInterrupted?.();
+        };
+        return {
+          result: new Promise(() => {}),
+          getThreadId: () => "thread-1",
+          queueMessage: vi.fn(async () => false),
+          interrupt: vi.fn(async () => {
+            await interrupted?.();
+          }),
+          isAwaitingInput: () => false,
+          submitPendingInput: vi.fn(async () => false),
+          submitPendingInputPayload: vi.fn(async () => false),
+        };
+      }),
+    };
+    (controller as any).client = clientMock;
+
+    await controller.start();
+    await (controller as any).startTurn({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      binding: (controller as any).store.getBinding({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      }),
+      workspaceDir: "/repo/openclaw",
+      prompt: "Continue the chipcdx production task",
+      reason: "command",
+    });
+
+    await controller.stop();
+    await flushAsyncWork();
+
+    const binding = (controller as any).store.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123",
+    });
+    expect(binding?.taskState?.stage).toBe("executing");
+    const sentTexts = harness.sendMessageTelegram.mock.calls.flatMap((call) => {
+      const [, text] = call as unknown as [unknown, unknown];
+      return typeof text === "string" ? [text] : [];
+    });
+    expect(sentTexts).not.toContain("Codex stopped.");
+  });
 });
