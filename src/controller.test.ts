@@ -5332,6 +5332,21 @@ describe("Discord controller flows", () => {
       (controller as any).client = clientMock;
       (controller as any).readThreadHasChanges = vi.fn(async () => false);
 
+      vi.mocked(fetch).mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            success: true,
+            data: [
+              'ID: 7345 | Claw | Date: 2026-04-12 12:16:03+00:00 | Message: Codex is still working...',
+              'ID: 7344 | Evgeny "Chip" | Date: 2026-04-12 12:15:40+00:00 | Message: Unrelated chat noise',
+              'ID: 7343 | Evgeny "Chip" | Date: 2026-04-12 12:14:16+00:00 | reply to 7342 | Message: Add the latest Telegram context before resuming',
+              'ID: 7342 | Evgeny "Chip" | Date: 2026-04-12 12:13:00+00:00 | Message: Resume from the saved checkpoint and keep the real thread context',
+            ].join("\n"),
+          }),
+      } as Response);
+
       await controller.start();
       await Promise.resolve();
       await Promise.resolve();
@@ -5348,6 +5363,16 @@ describe("Discord controller flows", () => {
           existingThreadId: "thread-1",
           workspaceDir: "/repo/openclaw",
           prompt: expect.stringContaining("Resume the current Codex task"),
+          input: [
+            expect.objectContaining({
+              type: "text",
+              text: expect.stringContaining("Add the latest Telegram context before resuming"),
+            }),
+            expect.objectContaining({
+              type: "text",
+              text: expect.stringContaining("Resume the current Codex task"),
+            }),
+          ],
         }),
       );
 
@@ -5681,6 +5706,18 @@ describe("Discord controller flows", () => {
     };
     (controller as any).client = clientMock;
     (controller as any).readThreadHasChanges = vi.fn(async () => false);
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      text: async () =>
+        JSON.stringify({
+          success: true,
+          data: [
+            'ID: 6691 | Evgeny "Chip" | Date: 2026-04-12 12:20:00+00:00 | reply to 6685 | Message: Use the fresh thread but keep the last Telegram context',
+            'ID: 6685 | Evgeny "Chip" | Date: 2026-04-12 12:10:00+00:00 | Message: Original stale status topic root',
+          ].join("\n"),
+        }),
+    } as Response);
 
     await controller.start();
 
@@ -5690,6 +5727,16 @@ describe("Discord controller flows", () => {
         existingThreadId: "fresh-thread",
         workspaceDir: "/repo/openclaw",
         prompt: expect.stringContaining("The previous Codex status thread became stale."),
+        input: [
+          expect.objectContaining({
+            type: "text",
+            text: expect.stringContaining("Use the fresh thread but keep the last Telegram context"),
+          }),
+          expect.objectContaining({
+            type: "text",
+            text: expect.stringContaining("The previous Codex status thread became stale."),
+          }),
+        ],
       }),
     );
     const reloadedStore = new PluginStateStore(harness.stateDir);
@@ -7855,6 +7902,18 @@ describe("Discord controller flows", () => {
     }));
     (controller as any).client.startTurn = startTurn;
     const editMessage = vi.fn(async (_payload: any) => {});
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      text: async () =>
+        JSON.stringify({
+          success: true,
+          data: [
+            'ID: 460 | Evgeny "Chip" | Date: 2026-04-12 12:16:03+00:00 | reply to 456 | Message: Keep the last Telegram asks in recovery',
+            'ID: 456 | Evgeny "Chip" | Date: 2026-04-12 12:10:00+00:00 | Message: Resume this exact thread after the crash',
+          ].join("\n"),
+        }),
+    } as Response);
 
     await controller.handleTelegramInteractive({
       channel: "telegram",
@@ -7874,6 +7933,16 @@ describe("Discord controller flows", () => {
 
     expect(startTurn).toHaveBeenCalledWith(expect.objectContaining({
       prompt: expect.stringContaining("Resume the current Codex task from the existing long-lived thread context."),
+      input: [
+        expect.objectContaining({
+          type: "text",
+          text: expect.stringContaining("Keep the last Telegram asks in recovery"),
+        }),
+        expect.objectContaining({
+          type: "text",
+          text: expect.stringContaining("Resume the current Codex task from the existing long-lived thread context."),
+        }),
+      ],
     }));
     expect(startTurn).toHaveBeenCalledWith(expect.objectContaining({
       prompt: expect.stringContaining("Goal: Ship the long-lived cockpit flow"),

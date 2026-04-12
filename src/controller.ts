@@ -250,6 +250,19 @@ const MAX_TEXT_ATTACHMENT_CHARS = 16_000;
 const INBOUND_MEDIA_FALLBACK_DIR = "/home/chip/.openclaw/media/inbound";
 const INBOUND_MEDIA_FALLBACK_MAX_AGE_MS = 10 * 60 * 1000;
 const INBOUND_MEDIA_FALLBACK_MATCH_WINDOW_MS = 3 * 60 * 1000;
+const TELEGRAM_CHIP_API_BASE = process.env.TELEGRAM_CHIP_API_BASE?.trim() || "http://127.0.0.1:8080";
+const TELEGRAM_CHIP_REQUEST_TIMEOUT_MS = 8_000;
+const TELEGRAM_RECOVERY_CONTEXT_PAGE_SIZE = 60;
+const TELEGRAM_RECOVERY_CONTEXT_MAX_MESSAGES = 8;
+const TELEGRAM_RECOVERY_CONTEXT_MAX_CHARS = 4_000;
+const TELEGRAM_RECOVERY_NOISE_PATTERNS = [
+  "codex is still working",
+  "gateway restarted while codex was working",
+  "detected a stale codex status thread",
+  "resuming the task from the saved checkpoint",
+  "continuing from the saved task card",
+  "resuming codex from the latest checkpoint",
+];
 const PLUGIN_VERSION = (() => {
   try {
     const packageJson = require("../package.json") as { version?: unknown };
@@ -388,6 +401,20 @@ type PlanDelivery = {
 
 type DeliveredMessageRef = InteractiveMessageRef;
 
+type TelegramChipApiResponse = {
+  success?: boolean;
+  data?: unknown;
+  error?: unknown;
+};
+
+type TelegramChipMessageSummary = {
+  id: number;
+  sender: string;
+  date?: string;
+  replyTo?: number;
+  text: string;
+};
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -404,6 +431,34 @@ function isTelegramChannel(channel: string): boolean {
 
 function isDiscordChannel(channel: string): boolean {
   return channel.trim().toLowerCase() === "discord";
+}
+
+function parseTelegramChipMessageSummaryList(raw: string): TelegramChipMessageSummary[] {
+  const messages: TelegramChipMessageSummary[] = [];
+  for (const line of raw.split("\n")) {
+    const match = /^ID:\s*(\d+)\s*\|\s*(.*?)\s*\|\s*Date:\s*([^|]+?)(?:\s*\|\s*reply to\s*(\d+))?(?:\s*\|\s*[^|]+)*\s*\|\s*Message:\s*(.*)$/u.exec(
+      line,
+    );
+    if (!match) {
+      continue;
+    }
+    messages.push({
+      id: Number(match[1]),
+      sender: match[2]?.trim() || "Unknown",
+      date: match[3]?.trim() || undefined,
+      replyTo: match[4] ? Number(match[4]) : undefined,
+      text: match[5]?.trim() || "",
+    });
+  }
+  return messages;
+}
+
+function isTelegramRecoveryNoiseText(text: string): boolean {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+  return TELEGRAM_RECOVERY_NOISE_PATTERNS.some((pattern) => normalized.includes(pattern));
 }
 
 const IMAGE_FILE_EXTENSIONS = new Set([
@@ -2230,6 +2285,11 @@ export class CodexPluginController {
       this.api.logger.info?.(
         `codex startup recovery resuming interrupted turn ${this.formatConversationForLog(conversation)} thread=${binding.threadId}`,
       );
+      const resumePrompt = buildResumeTaskPrompt(binding.taskState);
+      const recoveryInput = await this.buildRecoveryTurnInput({
+        conversation,
+        prompt: resumePrompt,
+      });
       await this.sendText(
         conversation,
         "Gateway restarted while Codex was working. Resuming the task from the saved checkpoint.",
@@ -2238,7 +2298,8 @@ export class CodexPluginController {
         conversation,
         binding,
         workspaceDir: binding.workspaceDir,
-        prompt: buildResumeTaskPrompt(binding.taskState),
+        prompt: resumePrompt,
+        input: recoveryInput,
         reason: "command",
         skipProgressKeepalive: true,
       });
@@ -6933,11 +6994,17 @@ export class CodexPluginController {
         configuredWorkspaceDir: this.settings.defaultWorkspaceDir,
         serviceWorkspaceDir: this.serviceWorkspaceDir,
       });
+      const resumePrompt = buildResumeTaskPrompt(binding.taskState);
+      const recoveryInput = await this.buildRecoveryTurnInput({
+        conversation,
+        prompt: resumePrompt,
+      });
       await this.startTurn({
         conversation,
         binding,
         workspaceDir,
-        prompt: buildResumeTaskPrompt(binding.taskState),
+        prompt: resumePrompt,
+        input: recoveryInput,
         reason: "command",
       });
       const nextBinding = this.store.getBinding(callback.conversation) ?? binding;
@@ -7953,6 +8020,98 @@ export class CodexPluginController {
     return `${trimmed.slice(0, maxLength - 3).trimEnd()}...`;
   }
 
+  private async buildRecoveryTurnInput(params: {
+    conversation: ConversationTarget;
+    prompt: string;
+  }): Promise<readonly CodexTurnInputItem[] | undefined> {
+    const contextText = await this.loadTelegramRecoveryContext(params.conversation);
+    if (!contextText) {
+      return undefined;
+    }
+    return [
+      { type: "text", text: contextText },
+      { type: "text", text: params.prompt },
+    ];
+  }
+
+  private async loadTelegramRecoveryContext(
+    conversation: ConversationTarget,
+  ): Promise<string | undefined> {
+    if (!isTelegramChannel(conversation.channel)) {
+      return undefined;
+    }
+    const chatId = normalizeTelegramChatId(
+      conversation.parentConversationId ?? conversation.conversationId,
+    );
+    if (!chatId) {
+      return undefined;
+    }
+    const requestUrl = new URL(
+      `/chats/${encodeURIComponent(chatId)}/messages`,
+      TELEGRAM_CHIP_API_BASE,
+    );
+    requestUrl.searchParams.set("page", "1");
+    requestUrl.searchParams.set("page_size", String(TELEGRAM_RECOVERY_CONTEXT_PAGE_SIZE));
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => {
+      abortController.abort();
+    }, TELEGRAM_CHIP_REQUEST_TIMEOUT_MS);
+    try {
+      const response = await fetch(requestUrl.toString(), {
+        method: "GET",
+        signal: abortController.signal,
+      });
+      const responseText = await response.text();
+      if (!response.ok) {
+        throw new Error(
+          `status=${response.status} body=${this.trimReplayText(responseText, 400) ?? "<empty>"}`,
+        );
+      }
+      const parsed = responseText.trim()
+        ? (JSON.parse(responseText) as TelegramChipApiResponse)
+        : undefined;
+      if (!parsed?.success) {
+        const errorText =
+          typeof parsed?.error === "string" && parsed.error.trim()
+            ? parsed.error.trim()
+            : responseText.trim() || "telegram-chip returned an empty response";
+        throw new Error(errorText);
+      }
+      const rawMessages = typeof parsed.data === "string" ? parsed.data : "";
+      let messages = parseTelegramChipMessageSummaryList(rawMessages).filter(
+        (message) => !isTelegramRecoveryNoiseText(message.text),
+      );
+      if (typeof conversation.threadId === "number") {
+        messages = messages.filter(
+          (message) => message.id === conversation.threadId || message.replyTo === conversation.threadId,
+        );
+      }
+      const relevant = messages.slice(-TELEGRAM_RECOVERY_CONTEXT_MAX_MESSAGES);
+      if (relevant.length === 0) {
+        return undefined;
+      }
+      const lines = relevant.reverse().map((message) => {
+        const datePrefix = message.date?.trim() ? `[${message.date.trim()}] ` : "";
+        const text = this.trimReplayText(message.text.replace(/\s+/gu, " "), 480) ?? "";
+        return `- ${datePrefix}${message.sender}: ${text}`;
+      });
+      const contextBlock = [
+        "Recent relevant Telegram messages before recovery (oldest first):",
+        ...lines,
+        "",
+        "Use the Telegram context above to recover the task accurately before continuing.",
+      ].join("\n");
+      return this.trimReplayText(contextBlock, TELEGRAM_RECOVERY_CONTEXT_MAX_CHARS);
+    } catch (error) {
+      this.api.logger.warn?.(
+        `codex telegram recovery context load failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
+      );
+      return undefined;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   private isImplicitStopMessage(content: string): boolean {
     const normalized = content.trim().toLowerCase().replace(/[.!?…]+$/u, "");
     return normalized === "stop";
@@ -8856,11 +9015,17 @@ export class CodexPluginController {
       permissionsMode: profile,
       preferences: binding.preferences,
     });
+    const recoveryPrompt = buildFreshThreadRecoveryPrompt(rebound.taskState, foreignTopicRefs);
+    const recoveryInput = await this.buildRecoveryTurnInput({
+      conversation,
+      prompt: recoveryPrompt,
+    });
     await this.startTurn({
       conversation,
       binding: rebound,
       workspaceDir: rebound.workspaceDir,
-      prompt: buildFreshThreadRecoveryPrompt(rebound.taskState, foreignTopicRefs),
+      prompt: recoveryPrompt,
+      input: recoveryInput,
       reason: "command",
       skipProgressKeepalive: true,
     });
