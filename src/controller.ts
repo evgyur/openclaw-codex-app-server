@@ -1137,6 +1137,13 @@ const REVIEW_PROGRESS_DELAY_MS = 12_000;
 const COMPACT_PROGRESS_DELAY_MS = 12_000;
 const COMPACT_PROGRESS_INTERVAL_MS = 15_000;
 const STARTUP_TASK_RECOVERY_WINDOW_MS = 15 * 60_000;
+const BINDING_RECONCILE_INTERVAL_MS = 5 * 60_000;
+const STALE_VERIFY_ROLLOUT_IDLE_MS = 45 * 60_000;
+const STALE_VERIFY_REMAINING_PERCENT_MAX = 40;
+const STALE_VERIFY_CHILD_ROLLOUT_COUNT_MIN = 8;
+const STALE_VERIFY_AUTORECOVER_COOLDOWN_MS = 4 * 60 * 60_000;
+const STALE_VERIFY_ROLLOUT_LOOKBACK_DAYS = 4;
+const DAY_MS = 24 * 60 * 60_000;
 const PLAN_INLINE_TEXT_LIMIT = 2600;
 
 function isTransportClosedMessage(error: unknown): boolean {
@@ -1590,6 +1597,35 @@ function buildResumeTaskPrompt(taskState: TaskCardState | undefined): string {
   return lines.join("\n");
 }
 
+function buildFreshThreadRecoveryPrompt(
+  taskState: TaskCardState | undefined,
+  foreignTopicRefs: string[] = [],
+): string {
+  const lines = [
+    "The previous Codex status thread became stale. Resume the task on this fresh thread using the saved task card.",
+  ];
+  if (taskState?.goal?.trim()) {
+    lines.push(`Goal: ${taskState.goal.trim()}`);
+  }
+  if (taskState?.checkpoint?.summary?.trim()) {
+    lines.push(`Checkpoint: ${taskState.checkpoint.summary.trim()}`);
+  }
+  if (taskState?.checkpoint?.nextAction?.trim()) {
+    lines.push(`Checkpoint next action: ${taskState.checkpoint.nextAction.trim()}`);
+  }
+  if (taskState?.nextAction?.trim()) {
+    lines.push(`Current next action: ${taskState.nextAction.trim()}`);
+  }
+  if (taskState?.latestEvidence?.trim()) {
+    lines.push(`Latest evidence: ${taskState.latestEvidence.trim()}`);
+  }
+  if (foreignTopicRefs.length > 0) {
+    lines.push(`Ignore stale carry-over that references other topics: ${foreignTopicRefs.map((value) => `topic:${value}`).join(", ")}.`);
+  }
+  lines.push("Do not rely on the old stale status thread. Reconstruct the real current state, continue the work, and report only fresh progress.");
+  return lines.join("\n");
+}
+
 function getTaskCardReadyStage(taskState: TaskCardState | undefined, activeMode?: "default" | "plan"): TaskStage {
   if (activeMode === "plan") {
     return "planned";
@@ -1988,9 +2024,11 @@ export class CodexPluginController {
   private readonly settings;
   private readonly client;
   private readonly activeRuns = new Map<string, ActiveRunRecord>();
+  private readonly recentAutoRecoveries = new Map<string, number>();
   private readonly threadChangesCache = new Map<string, Promise<boolean | undefined>>();
   private readonly processedAudioHookMessages = new Map<string, number>();
   private readonly store;
+  private bindingReconcileInterval: ReturnType<typeof setInterval> | null = null;
   private serviceWorkspaceDir?: string;
   private lastRuntimeConfig?: unknown;
   private started = false;
@@ -2029,8 +2067,12 @@ export class CodexPluginController {
       await this.client.logStartupProbe().catch(() => undefined);
       this.stopping = false;
       this.started = true;
+      this.startBindingReconcileLoop();
       await this.recoverInterruptedTurnsOnStartup().catch((error) => {
         this.api.logger.warn(`codex startup recovery failed: ${String(error)}`);
+      });
+      await this.reconcileBindings().catch((error) => {
+        this.api.logger.warn(`codex binding reconcile failed: ${String(error)}`);
       });
     })();
     try {
@@ -2048,6 +2090,10 @@ export class CodexPluginController {
       return;
     }
     this.stopping = true;
+    if (this.bindingReconcileInterval) {
+      clearInterval(this.bindingReconcileInterval);
+      this.bindingReconcileInterval = null;
+    }
     for (const active of this.activeRuns.values()) {
       await active.handle.interrupt().catch(() => undefined);
     }
@@ -8685,8 +8731,195 @@ export class CodexPluginController {
     await this.store.removeBinding(conversation);
   }
 
+  private startBindingReconcileLoop(): void {
+    if (this.bindingReconcileInterval) {
+      return;
+    }
+    this.bindingReconcileInterval = setInterval(() => {
+      void this.reconcileBindings().catch((error) => {
+        this.api.logger.warn(`codex binding reconcile failed: ${String(error)}`);
+      });
+    }, BINDING_RECONCILE_INTERVAL_MS);
+    this.bindingReconcileInterval.unref?.();
+  }
+
+  private extractTelegramTopicId(conversationId: string | undefined): string | undefined {
+    return /:topic:(\d+)$/.exec(conversationId?.trim() ?? "")?.[1];
+  }
+
+  private extractForeignTopicRefs(texts: Array<string | undefined>, currentTopicId?: string): string[] {
+    const refs = new Set<string>();
+    for (const text of texts) {
+      if (!text) {
+        continue;
+      }
+      for (const match of text.matchAll(/\btopic:(\d+)\b/g)) {
+        const topicId = match[1]?.trim();
+        if (topicId && topicId !== currentTopicId) {
+          refs.add(topicId);
+        }
+      }
+    }
+    return [...refs];
+  }
+
+  private async collectRecentChildRolloutStats(
+    now = Date.now(),
+  ): Promise<Map<string, { count: number; latestAt: number }>> {
+    const stats = new Map<string, { count: number; latestAt: number }>();
+    const baseDir = path.join(process.env.HOME?.trim() || "/home/chip", ".openclaw", "codex-home", "sessions");
+    const cutoff = now - STALE_VERIFY_ROLLOUT_LOOKBACK_DAYS * DAY_MS;
+    for (let offset = 0; offset < STALE_VERIFY_ROLLOUT_LOOKBACK_DAYS; offset += 1) {
+      const current = new Date(now - offset * DAY_MS);
+      const dayDir = path.join(
+        baseDir,
+        String(current.getFullYear()),
+        String(current.getMonth() + 1).padStart(2, "0"),
+        String(current.getDate()).padStart(2, "0"),
+      );
+      const entries = await fs.readdir(dayDir, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (!entry.isFile() || !entry.name.startsWith("rollout-") || !entry.name.endsWith(".jsonl")) {
+          continue;
+        }
+        const filePath = path.join(dayDir, entry.name);
+        const firstLine = (await fs.readFile(filePath, "utf8").catch(() => "")).split("\n", 1)[0]?.trim();
+        if (!firstLine) {
+          continue;
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(firstLine);
+        } catch {
+          continue;
+        }
+        const record = asRecord(parsed);
+        const payload = asRecord(record?.payload);
+        const source = asRecord(payload?.source);
+        const subagent = asRecord(source?.subagent);
+        const threadSpawn = asRecord(subagent?.thread_spawn);
+        const parentThreadId = typeof threadSpawn?.parent_thread_id === "string"
+          ? threadSpawn.parent_thread_id.trim()
+          : "";
+        if (!parentThreadId) {
+          continue;
+        }
+        const timestampRaw =
+          typeof record?.timestamp === "string"
+            ? record.timestamp
+            : typeof payload?.timestamp === "string"
+              ? payload.timestamp
+              : undefined;
+        const timestamp = timestampRaw ? Date.parse(timestampRaw) : Number.NaN;
+        if (Number.isFinite(timestamp) && timestamp < cutoff) {
+          continue;
+        }
+        const existing = stats.get(parentThreadId);
+        stats.set(parentThreadId, {
+          count: (existing?.count ?? 0) + 1,
+          latestAt: Math.max(existing?.latestAt ?? 0, Number.isFinite(timestamp) ? timestamp : now),
+        });
+      }
+    }
+    return stats;
+  }
+
+  private async recoverStaleVerifyingBinding(params: {
+    binding: StoredBinding;
+    conversation: ConversationTarget;
+    foreignTopicRefs: string[];
+    rolloutCount: number;
+    rolloutIdleMs: number;
+  }): Promise<void> {
+    const { binding, conversation, foreignTopicRefs, rolloutCount, rolloutIdleMs } = params;
+    const conversationKey = buildConversationKey(conversation);
+    this.recentAutoRecoveries.set(conversationKey, Date.now());
+    const profile = this.getPermissionsMode(binding);
+    this.api.logger.info?.(
+      `codex auto-recovering stale verifying binding ${this.formatConversationForLog(conversation)} thread=${binding.threadId} rolloutCount=${rolloutCount} rolloutIdleMs=${rolloutIdleMs} foreignTopics=${foreignTopicRefs.join(",") || "<none>"}`,
+    );
+    await this.sendText(
+      conversation,
+      "Detected a stale Codex status thread. Rebinding this topic to a fresh thread and continuing from the saved task card.",
+    );
+    const created = await this.client.startThread({
+      profile,
+      sessionKey: binding.sessionKey,
+      workspaceDir: binding.workspaceDir,
+      model: binding.preferences?.preferredModel?.trim() || undefined,
+    });
+    const rebound = await this.bindConversation(conversation, {
+      sessionKey: binding.sessionKey,
+      threadId: created.threadId,
+      workspaceDir: created.cwd?.trim() || binding.workspaceDir,
+      threadTitle: created.threadName,
+      permissionsMode: profile,
+      preferences: binding.preferences,
+    });
+    await this.startTurn({
+      conversation,
+      binding: rebound,
+      workspaceDir: rebound.workspaceDir,
+      prompt: buildFreshThreadRecoveryPrompt(rebound.taskState, foreignTopicRefs),
+      reason: "command",
+      skipProgressKeepalive: true,
+    });
+  }
+
   private async reconcileBindings(): Promise<void> {
-    return;
+    const now = Date.now();
+    const rolloutStats = await this.collectRecentChildRolloutStats(now);
+    for (const binding of this.store.listBindings()) {
+      const conversation = this.toConversationTarget(binding.conversation);
+      const conversationKey = buildConversationKey(conversation);
+      const taskState = binding.taskState;
+      if (!binding.threadId.trim() || !binding.workspaceDir.trim()) {
+        continue;
+      }
+      if (this.activeRuns.has(conversationKey) || this.store.getPendingRequestByConversation(conversation)) {
+        continue;
+      }
+      if (taskState?.stage !== "verifying" || taskState.verification?.status !== "unverified") {
+        continue;
+      }
+      const lastRecoveredAt = this.recentAutoRecoveries.get(conversationKey) ?? 0;
+      if (now - lastRecoveredAt < STALE_VERIFY_AUTORECOVER_COOLDOWN_MS) {
+        continue;
+      }
+      const rollout = rolloutStats.get(binding.threadId);
+      const rolloutCount = rollout?.count ?? 0;
+      const rolloutIdleMs = rollout?.latestAt ? now - rollout.latestAt : Number.POSITIVE_INFINITY;
+      if (rolloutIdleMs < STALE_VERIFY_ROLLOUT_IDLE_MS) {
+        continue;
+      }
+      const currentTopicId = this.extractTelegramTopicId(binding.conversation.conversationId);
+      const foreignTopicRefs = this.extractForeignTopicRefs(
+        [
+          taskState.latestEvidence,
+          taskState.lastRunSummary,
+          taskState.checkpoint?.summary,
+          taskState.resumeReason,
+        ],
+        currentTopicId,
+      );
+      const lowContextRemaining = typeof binding.contextUsage?.remainingPercent === "number" &&
+        binding.contextUsage.remainingPercent <= STALE_VERIFY_REMAINING_PERCENT_MAX;
+      const heavyRolloutFanout = rolloutCount >= STALE_VERIFY_CHILD_ROLLOUT_COUNT_MIN;
+      if (!lowContextRemaining && !heavyRolloutFanout && foreignTopicRefs.length === 0) {
+        continue;
+      }
+      await this.recoverStaleVerifyingBinding({
+        binding,
+        conversation,
+        foreignTopicRefs,
+        rolloutCount,
+        rolloutIdleMs,
+      }).catch((error) => {
+        this.api.logger.warn(
+          `codex stale verifying auto-recovery failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
+        );
+      });
+    }
   }
 
   private async startTypingLease(conversation: ConversationTarget): Promise<{

@@ -5574,6 +5574,142 @@ describe("Discord controller flows", () => {
     ).toHaveLength(1);
   });
 
+  it("auto-recovers stale verifying bindings onto a fresh thread", async () => {
+    const harness = createApiMock();
+    const store = new PluginStateStore(harness.stateDir);
+    await store.load();
+    await store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "-1003701370893:topic:6685",
+        parentConversationId: "-1003701370893",
+      },
+      sessionKey: "openclaw-codex-app-server:thread:old-thread",
+      threadId: "old-thread",
+      workspaceDir: "/repo/openclaw",
+      contextUsage: {
+        remainingPercent: 34,
+      },
+      taskState: {
+        stage: "verifying",
+        goal: "?",
+        nextAction: "Review the latest Codex result",
+        latestEvidence: "This stale summary still talks about topic:4 instead of the current topic.",
+        verification: {
+          status: "unverified",
+          updatedAt: Date.now() - 10 * 60_000,
+        },
+        lastHeartbeatAt: Date.now() - 10 * 60_000,
+        updatedAt: Date.now() - 10 * 60_000,
+      },
+      updatedAt: Date.now() - 10 * 60_000,
+    });
+
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-codex-home-"));
+    vi.stubEnv("HOME", fakeHome);
+    const now = new Date();
+    const sessionDir = path.join(
+      fakeHome,
+      ".openclaw",
+      "codex-home",
+      "sessions",
+      String(now.getFullYear()),
+      String(now.getMonth() + 1).padStart(2, "0"),
+      String(now.getDate()).padStart(2, "0"),
+    );
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionDir, "rollout-stale.jsonl"),
+      `${JSON.stringify({
+        timestamp: new Date(Date.now() - 2 * 60 * 60_000).toISOString(),
+        type: "session_meta",
+        payload: {
+          source: {
+            subagent: {
+              thread_spawn: {
+                parent_thread_id: "old-thread",
+              },
+            },
+          },
+        },
+      })}\n`,
+      "utf8",
+    );
+
+    const controller = new CodexPluginController(harness.api);
+    const clientMock = {
+      hasProfile: vi.fn((profile: string) => profile === "default" || profile === "full-access"),
+      logStartupProbe: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+      startThread: vi.fn(async () => ({
+        threadId: "fresh-thread",
+        threadName: "Fresh Thread",
+        model: "openai/gpt-5.4",
+        cwd: "/repo/openclaw",
+        serviceTier: "default",
+      })),
+      startTurn: vi.fn(() => ({
+        result: new Promise(() => {}),
+        getThreadId: () => "fresh-thread",
+        queueMessage: vi.fn(async () => false),
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      })),
+      readThreadState: vi.fn(async () => ({
+        threadId: "fresh-thread",
+        threadName: "Fresh Thread",
+        model: "openai/gpt-5.4",
+        cwd: "/repo/openclaw",
+        serviceTier: "default",
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+      })),
+      readThreadContext: vi.fn(async () => ({
+        lastUserMessage: undefined,
+        lastAssistantMessage: undefined,
+      })),
+      readAccount: vi.fn(async () => ({
+        email: "test@example.com",
+        planType: "pro",
+        type: "chatgpt",
+      })),
+      readRateLimits: vi.fn(async () => []),
+      listModels: vi.fn(async () => [{ id: "openai/gpt-5.4", current: true }]),
+    };
+    (controller as any).client = clientMock;
+    (controller as any).readThreadHasChanges = vi.fn(async () => false);
+
+    await controller.start();
+
+    expect(clientMock.startThread).toHaveBeenCalledTimes(1);
+    expect(clientMock.startTurn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        existingThreadId: "fresh-thread",
+        workspaceDir: "/repo/openclaw",
+        prompt: expect.stringContaining("The previous Codex status thread became stale."),
+      }),
+    );
+    const reloadedStore = new PluginStateStore(harness.stateDir);
+    await reloadedStore.load();
+    const rebound = reloadedStore.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "-1003701370893:topic:6685",
+      parentConversationId: "-1003701370893",
+    });
+    expect(rebound?.threadId).toBe("fresh-thread");
+    const sentTexts = harness.sendMessageTelegram.mock.calls.flatMap((call) => {
+      const [, text] = call as unknown as [unknown, unknown];
+      return typeof text === "string" ? [text] : [];
+    });
+    expect(sentTexts).toContain(
+      "Detected a stale Codex status thread. Rebinding this topic to a fresh thread and continuing from the saved task card.",
+    );
+  });
+
   it("does not resend the same questionnaire state when plan mode repeats the same pending input", async () => {
     const harness = await createControllerHarness();
     const { controller, sendMessageTelegram } = harness;
