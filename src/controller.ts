@@ -1556,6 +1556,16 @@ function isInlineBlockerCheckpoint(summary: string | undefined): boolean {
     normalized === "Codex failed before completion";
 }
 
+function isPendingInputTaskState(taskState: TaskCardState | undefined): boolean {
+  const blocker = taskState?.blocker?.trim();
+  const checkpoint = taskState?.checkpoint?.summary?.trim();
+  return taskState?.stage === "clarifying" ||
+    blocker === "Codex is waiting for questionnaire answers" ||
+    blocker === "Codex is waiting for input" ||
+    checkpoint === "Codex asked a questionnaire" ||
+    checkpoint === "Codex paused for input";
+}
+
 function buildResumeTaskPrompt(taskState: TaskCardState | undefined): string {
   const lines = ["Resume the current Codex task from the existing long-lived thread context."];
   if (taskState?.goal?.trim()) {
@@ -2190,6 +2200,19 @@ export class CodexPluginController {
     }
   }
 
+  private shouldSuppressPendingInputKeepalive(
+    conversation: ConversationTarget,
+    handle?: Pick<ActiveCodexRun, "isAwaitingInput"> | null,
+  ): boolean {
+    if (handle?.isAwaitingInput()) {
+      return true;
+    }
+    if (this.store.getPendingRequestByConversation(conversation)) {
+      return true;
+    }
+    return isPendingInputTaskState(this.store.getBinding(conversation)?.taskState);
+  }
+
   private startRecoveryTurnKeepalive(
     conversation: ConversationTarget,
     initialBinding: StoredBinding,
@@ -2207,6 +2230,10 @@ export class CodexPluginController {
     const tick = async () => {
       const active = this.activeRuns.get(key);
       if (!active || active.handle !== handle) {
+        stop();
+        return;
+      }
+      if (this.shouldSuppressPendingInputKeepalive(conversation, handle)) {
         stop();
         return;
       }
@@ -4818,16 +4845,25 @@ export class CodexPluginController {
       }
     }
     const typing = await this.startTypingLease(params.conversation);
+    let run: ActiveCodexRun | null = null;
     let keepaliveInterval: ReturnType<typeof setInterval> | null = null;
     let progressTimer: ReturnType<typeof setTimeout> | null = null;
     if (!params.skipProgressKeepalive) {
       progressTimer = setTimeout(() => {
         void (async () => {
+          if (this.shouldSuppressPendingInputKeepalive(params.conversation, run)) {
+            stopProgressTimer();
+            return;
+          }
           binding = (await this.touchTaskHeartbeat(binding)) ?? binding;
           await this.sendText(params.conversation, "Codex is still working...");
         })();
         keepaliveInterval = setInterval(() => {
           void (async () => {
+            if (this.shouldSuppressPendingInputKeepalive(params.conversation, run)) {
+              stopProgressTimer();
+              return;
+            }
             binding = (await this.touchTaskHeartbeat(binding)) ?? binding;
             await this.sendText(params.conversation, "Codex is still working...");
           })();
@@ -4856,7 +4892,7 @@ export class CodexPluginController {
     );
     const sessionKey = this.resolveConversationSessionKey(params.conversation, binding);
     const existingThreadId = params.freshThread ? undefined : binding?.threadId;
-    const run = this.client.startTurn({
+    const createdRun = this.client.startTurn({
       profile,
       sessionKey,
       workspaceDir: params.workspaceDir,
@@ -4903,7 +4939,12 @@ export class CodexPluginController {
               "Wait for Codex to finish the current turn",
             ).catch(() => null)) ?? binding;
         }
-        await this.handlePendingInputState(params.conversation, params.workspaceDir, state, run);
+        await this.handlePendingInputState(
+          params.conversation,
+          params.workspaceDir,
+          state,
+          run ?? createdRun,
+        );
       },
       onFileEdits: async (text) => {
         binding =
@@ -4938,6 +4979,7 @@ export class CodexPluginController {
         await this.sendText(params.conversation, "Codex stopped.");
       },
     });
+    run = createdRun;
     this.api.logger.debug?.(
       `codex turn run handle created ${this.formatConversationForLog(params.conversation)}`,
     );
@@ -4946,11 +4988,11 @@ export class CodexPluginController {
       workspaceDir: params.workspaceDir,
       mode: params.collaborationMode?.mode === "plan" ? "plan" : "default",
       profile,
-      handle: run,
+      handle: createdRun,
     });
-    void (run.result as Promise<import("./types.js").TurnResult>)
+    void (createdRun.result as Promise<import("./types.js").TurnResult>)
       .then(async (result) => {
-        const threadId = result.threadId || run.getThreadId();
+        const threadId = result.threadId || createdRun.getThreadId();
         if (threadId) {
           const state = await this.client
             .readThreadState({
@@ -5211,10 +5253,12 @@ export class CodexPluginController {
             })
             .catch(() => null)
         : null;
+    let run: ActiveCodexRun | null = null;
     let keepaliveSent = false;
     let progressTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
       void (async () => {
-        if (keepaliveSent) {
+        if (keepaliveSent || this.shouldSuppressPendingInputKeepalive(params.conversation, run)) {
+          stopProgressTimer();
           return;
         }
         keepaliveSent = true;
@@ -5234,7 +5278,7 @@ export class CodexPluginController {
       this.settings.defaultModel,
     );
     const effectiveThreadState = desired.effectiveState;
-    const run = this.client.startTurn({
+    const createdRun = this.client.startTurn({
       profile,
       sessionKey: binding?.sessionKey,
       workspaceDir: params.workspaceDir,
@@ -5287,7 +5331,12 @@ export class CodexPluginController {
               "Wait for Codex to finish the current plan",
             ).catch(() => null)) ?? binding;
         }
-        await this.handlePendingInputState(params.conversation, params.workspaceDir, state, run);
+        await this.handlePendingInputState(
+          params.conversation,
+          params.workspaceDir,
+          state,
+          run ?? createdRun,
+        );
       },
       onInterrupted: async () => {
         binding =
@@ -5306,14 +5355,15 @@ export class CodexPluginController {
         await this.sendText(params.conversation, formatInterruptedText("plan"));
       },
     });
+    run = createdRun;
     this.activeRuns.set(key, {
       conversation: params.conversation,
       workspaceDir: params.workspaceDir,
       mode: "plan",
       profile,
-      handle: run,
+      handle: createdRun,
     });
-    void (run.result as Promise<import("./types.js").TurnResult>)
+    void (createdRun.result as Promise<import("./types.js").TurnResult>)
       .then(async (result) => {
         const threadId = result.threadId || run.getThreadId();
         if (threadId) {
@@ -5467,10 +5517,12 @@ export class CodexPluginController {
       );
     }
     const typing = await this.startTypingLease(params.conversation);
+    let run: ActiveCodexRun | null = null;
     let keepaliveSent = false;
     let progressTimer: ReturnType<typeof setTimeout> | null = setTimeout(() => {
       void (async () => {
-        if (keepaliveSent) {
+        if (keepaliveSent || this.shouldSuppressPendingInputKeepalive(params.conversation, run)) {
+          stopProgressTimer();
           return;
         }
         keepaliveSent = true;
@@ -5496,7 +5548,7 @@ export class CodexPluginController {
       params.binding,
       this.settings.defaultModel,
     );
-    const run = this.client.startReview({
+    const createdRun = this.client.startReview({
       profile,
       sessionKey: params.binding.sessionKey,
       workspaceDir: params.workspaceDir,
@@ -5512,20 +5564,26 @@ export class CodexPluginController {
         if (state) {
           stopProgressTimer();
         }
-        await this.handlePendingInputState(params.conversation, params.workspaceDir, state, run);
+        await this.handlePendingInputState(
+          params.conversation,
+          params.workspaceDir,
+          state,
+          run ?? createdRun,
+        );
       },
       onInterrupted: async () => {
         await this.sendText(params.conversation, "Codex review stopped.");
       },
     });
+    run = createdRun;
     this.activeRuns.set(key, {
       conversation: params.conversation,
       workspaceDir: params.workspaceDir,
       mode: "review",
       profile,
-      handle: run,
+      handle: createdRun,
     });
-    void (run.result as Promise<import("./types.js").ReviewResult>)
+    void (createdRun.result as Promise<import("./types.js").ReviewResult>)
       .then(async (result) => {
         if (result.aborted) {
           await this.sendText(params.conversation, formatInterruptedText("review"));

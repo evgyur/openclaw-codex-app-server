@@ -5193,6 +5193,68 @@ describe("Discord controller flows", () => {
     }
   });
 
+  it("does not send the turn keepalive after the run is already awaiting input", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-12T03:40:00+03:00"));
+    try {
+      const harness = await createControllerHarness();
+      const { controller } = harness;
+      const { sendMessageTelegram } = harness;
+      let awaitingInput = false;
+      let resolveResult: ((value: unknown) => void) | undefined;
+      const result = new Promise((resolve) => {
+        resolveResult = resolve;
+      });
+      (controller as any).client.startTurn = vi.fn((_params: any) => {
+        void Promise.resolve().then(() => {
+          awaitingInput = true;
+        });
+        return {
+          result,
+          getThreadId: () => "thread-awaiting-input",
+          queueMessage: vi.fn(async () => false),
+          interrupt: vi.fn(async () => {}),
+          isAwaitingInput: () => awaitingInput,
+          submitPendingInput: vi.fn(async () => false),
+          submitPendingInputPayload: vi.fn(async () => false),
+        };
+      });
+
+      await (controller as any).startTurn({
+        conversation: {
+          channel: "telegram",
+          accountId: "default",
+          conversationId: TEST_TELEGRAM_PEER_ID,
+        },
+        binding: null,
+        workspaceDir: "/repo/openclaw",
+        prompt: "Ask a follow-up question.",
+        reason: "command",
+      });
+
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(12_500);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const sentTexts = sendMessageTelegram.mock.calls.flatMap((call) => {
+        const [, text] = call as unknown as [unknown, unknown];
+        return typeof text === "string" ? [text] : [];
+      });
+      expect(sentTexts).not.toContain("Codex is still working...");
+
+      resolveResult?.({
+        threadId: "thread-awaiting-input",
+        aborted: true,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("recovers a fresh executing task on startup and restarts the turn keepalive cadence", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-04-10T04:20:00+03:00"));
@@ -5310,6 +5372,110 @@ describe("Discord controller flows", () => {
       resolveResult?.({
         threadId: "thread-1",
         text: "Recovered completion.",
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not send recovery keepalive when the recovered run is already awaiting input", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-04-10T04:20:00+03:00"));
+    try {
+      const harness = createApiMock();
+      const store = new PluginStateStore(harness.stateDir);
+      await store.load();
+      await store.upsertBinding({
+        conversation: {
+          channel: "telegram",
+          accountId: "default",
+          conversationId: TEST_TELEGRAM_PEER_ID,
+        },
+        sessionKey: buildConversationSessionKey({
+          channel: "telegram",
+          accountId: "default",
+          conversationId: TEST_TELEGRAM_PEER_ID,
+        }),
+        threadId: "thread-awaiting-input",
+        workspaceDir: "/repo/openclaw",
+        taskState: {
+          stage: "executing",
+          goal: "Finish the cockpit recovery patch",
+          nextAction: "Wait for Codex to finish the current turn",
+          checkpoint: {
+            summary: "Gateway restarted before the turn completed",
+            nextAction: "Resume from the saved checkpoint",
+            savedAt: Date.now() - 20_000,
+          },
+          lastHeartbeatAt: Date.now() - 45_000,
+          updatedAt: Date.now() - 45_000,
+        },
+        updatedAt: Date.now() - 45_000,
+      });
+
+      let resolveResult: ((value: unknown) => void) | undefined;
+      const result = new Promise((resolve) => {
+        resolveResult = resolve;
+      });
+      const controller = new CodexPluginController(harness.api);
+      const clientMock = {
+        hasProfile: vi.fn((profile: string) => profile === "default" || profile === "full-access"),
+        logStartupProbe: vi.fn(async () => undefined),
+        close: vi.fn(async () => undefined),
+        listModels: vi.fn(async () => [{ id: "openai/gpt-5.4", current: true }]),
+        readThreadState: vi.fn(async () => ({
+          threadId: "thread-awaiting-input",
+          threadName: "Recovered Thread",
+          model: "openai/gpt-5.4",
+          cwd: "/repo/openclaw",
+          serviceTier: "default",
+          approvalPolicy: "on-request",
+          sandbox: "workspace-write",
+        })),
+        readThreadContext: vi.fn(async () => ({
+          lastUserMessage: "resume this",
+          lastAssistantMessage: undefined,
+        })),
+        readAccount: vi.fn(async () => ({
+          email: "test@example.com",
+          planType: "pro",
+          type: "chatgpt",
+        })),
+        readRateLimits: vi.fn(async () => []),
+        startTurn: vi.fn(() => ({
+          result,
+          getThreadId: () => "thread-awaiting-input",
+          queueMessage: vi.fn(async () => false),
+          interrupt: vi.fn(async () => {}),
+          isAwaitingInput: () => true,
+          submitPendingInput: vi.fn(async () => false),
+          submitPendingInputPayload: vi.fn(async () => false),
+        })),
+      };
+      (controller as any).client = clientMock;
+      (controller as any).readThreadHasChanges = vi.fn(async () => false);
+
+      await controller.start();
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(12_500);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const sentTexts = harness.sendMessageTelegram.mock.calls.flatMap((call) => {
+        const [, text] = call as unknown as [unknown, unknown];
+        return typeof text === "string" ? [text] : [];
+      });
+      expect(sentTexts).toContain(
+        "Gateway restarted while Codex was working. Resuming the task from the saved checkpoint.",
+      );
+      expect(sentTexts).not.toContain("Codex is still working...");
+
+      resolveResult?.({
+        threadId: "thread-awaiting-input",
+        aborted: true,
       });
       await Promise.resolve();
       await Promise.resolve();
