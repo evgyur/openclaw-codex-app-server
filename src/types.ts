@@ -352,6 +352,7 @@ export type StoredPendingBind = {
   syncTopic?: boolean;
   notifyBound?: boolean;
   preferences?: ConversationPreferences;
+  preserveTaskState?: boolean;
   updatedAt: number;
 };
 
@@ -375,6 +376,7 @@ export type CallbackAction =
       requestedModel?: string;
       requestedFast?: boolean;
       requestedYolo?: boolean;
+      preserveTaskState?: boolean;
       createdAt: number;
       expiresAt: number;
     }

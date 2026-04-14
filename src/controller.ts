@@ -6411,6 +6411,7 @@ export class CodexPluginController {
                   requestedModel: parsed.requestedModel,
                   requestedFast: parsed.requestedFast,
                   requestedYolo: parsed.requestedYolo,
+                  preserveTaskState: true,
                 });
               }
               return this.store.putCallback({
@@ -6568,6 +6569,7 @@ export class CodexPluginController {
         requestedModel: parsed.requestedModel,
         requestedFast: parsed.requestedFast,
         requestedYolo: parsed.requestedYolo,
+        preserveTaskState: true,
       });
       buttons.push([
         {
@@ -6743,6 +6745,7 @@ export class CodexPluginController {
           requestedYolo: callback.requestedYolo,
         },
         responders.requestConversationBinding,
+        callback.preserveTaskState ?? true,
       );
       if (result.status === "pending") {
         return;
@@ -7718,6 +7721,7 @@ export class CodexPluginController {
     syncTopic: boolean,
     overrides: CommandPreferenceOverrides,
     requestConversationBinding?: PickerResponders["requestConversationBinding"],
+    preserveTaskState = false,
   ): Promise<
     | { status: "bound" }
     | { status: "pending"; reply: ReplyPayload }
@@ -7748,6 +7752,7 @@ export class CodexPluginController {
         syncTopic,
         preferences,
         notifyBound: true,
+        preserveTaskState,
       },
       requestConversationBinding,
     );
@@ -7892,6 +7897,7 @@ export class CodexPluginController {
       permissionsMode?: PermissionsMode;
       pendingPermissionsMode?: PermissionsMode;
       preferences?: ConversationPreferences;
+      preserveTaskState?: boolean;
     },
   ): Promise<StoredBinding> {
     const existing = this.store.getBinding(conversation);
@@ -7900,6 +7906,7 @@ export class CodexPluginController {
       existing?.sessionKey?.trim() ||
       this.getResolvedRuntimeSessionKey(conversation) ||
       buildConversationSessionKey(conversation);
+    const preserveTaskState = params.preserveTaskState ?? true;
     const record: StoredBinding = {
       conversation: {
         channel: conversation.channel,
@@ -7918,7 +7925,7 @@ export class CodexPluginController {
       pinnedBindingMessage: existing?.pinnedBindingMessage,
       contextUsage: existing?.contextUsage,
       preferences: params.preferences ?? existing?.preferences,
-      taskState: existing?.taskState,
+      taskState: preserveTaskState ? existing?.taskState : undefined,
       updatedAt: Date.now(),
     };
     await this.store.upsertBinding(record);
@@ -7942,6 +7949,7 @@ export class CodexPluginController {
       threadTitle: pending.threadTitle,
       permissionsMode: normalizePermissionsMode(pending.permissionsMode),
       preferences: pending.preferences,
+      preserveTaskState: pending.preserveTaskState,
     });
     return { binding, pendingBind: pending };
   }
@@ -7956,6 +7964,7 @@ export class CodexPluginController {
       syncTopic?: boolean;
       notifyBound?: boolean;
       preferences?: ConversationPreferences;
+      preserveTaskState?: boolean;
     },
     requestBinding?: (
       params?: { summary?: string },
@@ -8000,6 +8009,7 @@ export class CodexPluginController {
           syncTopic: params.syncTopic,
           notifyBound: params.notifyBound,
           preferences: params.preferences,
+          preserveTaskState: params.preserveTaskState,
           updatedAt: Date.now(),
         });
       }

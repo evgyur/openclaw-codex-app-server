@@ -3404,6 +3404,103 @@ describe("Discord controller flows", () => {
     );
   });
 
+  it("clears inherited task state when /cas_new starts a fresh thread", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-old",
+      workspaceDir: "/repo/openclaw",
+      taskState: {
+        stage: "verifying",
+        goal: "Git push",
+        nextAction: "Review the latest Codex result",
+      },
+      updatedAt: Date.now(),
+    });
+
+    const reply = await controller.handleCommand(
+      "cas_new",
+      buildTelegramCommandContext({
+        commandBody: "/cas_new",
+        requestConversationBinding: vi.fn(async () => ({ status: "bound" as const })),
+        getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "binding-1" })),
+      }),
+    );
+
+    expect(reply).toEqual({});
+    const binding = (controller as any).store.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123",
+    });
+    expect(binding?.threadId).toBe("thread-new");
+    expect(binding?.taskState).toBeUndefined();
+  });
+
+  it("preserves task state when a /cas_resume new-thread callback starts a fresh thread", async () => {
+    const { controller } = await createControllerHarness();
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-old",
+      workspaceDir: "/repo/openclaw",
+      taskState: {
+        stage: "verifying",
+        goal: "Git push",
+        nextAction: "Review the latest Codex result",
+      },
+      updatedAt: Date.now(),
+    });
+    const callback = await (controller as any).store.putCallback({
+      kind: "start-new-thread",
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      workspaceDir: "/repo/openclaw",
+      preserveTaskState: true,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+    });
+
+    await controller.handleTelegramInteractive({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123",
+      callback: { payload: callback.token },
+      requestConversationBinding: vi.fn(async () => ({ status: "bound" as const })),
+      respond: {
+        clearButtons: vi.fn(async () => {}),
+        reply: vi.fn(async () => {}),
+        editMessage: vi.fn(async () => {}),
+      },
+    } as any);
+
+    const binding = (controller as any).store.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123",
+    });
+    expect(binding?.threadId).toBe("thread-new");
+    expect(binding?.taskState).toEqual(
+      expect.objectContaining({
+        stage: "verifying",
+        goal: "Git push",
+        nextAction: "Review the latest Codex result",
+      }),
+    );
+  });
+
   it("sends the Telegram bind approval prompt only once for resume callbacks", async () => {
     const { controller } = await createControllerHarness();
     const callback = await (controller as any).store.putCallback({
