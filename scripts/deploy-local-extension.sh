@@ -5,6 +5,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="${1:-$HOME/.openclaw/extensions/openclaw-codex-app-server}"
 
 mkdir -p "$TARGET"
+rm -rf "$TARGET/node_modules/openclaw"
 
 rsync -a --delete \
   --exclude '.git' \

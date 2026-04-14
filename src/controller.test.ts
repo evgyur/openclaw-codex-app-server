@@ -1486,8 +1486,66 @@ describe("Discord controller flows", () => {
       },
       expect.objectContaining({ accountId: "default" }),
     );
+    expect((controller as any).store.getPendingRequestById("questionnaire-1")).toBeNull();
     expect(reply).not.toHaveBeenCalled();
     expect(followUp).not.toHaveBeenCalled();
+  });
+
+  it("clears stored Discord pending-questionnaire buttons when asked directly", async () => {
+    const { controller } = await createControllerHarness();
+
+    await (controller as any).clearPendingRequestMessage(
+      {
+        channel: "discord",
+        accountId: "default",
+        conversationId: "channel:chan-1",
+      },
+      {
+        requestId: "questionnaire-clear-1",
+        conversation: {
+          channel: "discord",
+          accountId: "default",
+          conversationId: "channel:chan-1",
+        },
+        threadId: "thread-1",
+        workspaceDir: "/repo/openclaw",
+        pendingMessage: {
+          provider: "discord",
+          channelId: "channel:chan-1",
+          messageId: "pending-message-1",
+        },
+        state: {
+          requestId: "questionnaire-clear-1",
+          options: [],
+          expiresAt: Date.now() + 60_000,
+          method: "item/tool/requestUserInput",
+          questionnaire: {
+            currentIndex: 0,
+            questions: [
+              {
+                index: 0,
+                id: "scope",
+                header: "Scope",
+                prompt: "Which path should Codex take?",
+                options: [{ key: "A", label: "Safe", description: "Small prod-safe slice." }],
+                guidance: [],
+                allowFreeform: true,
+              },
+            ],
+            answers: [null],
+            responseMode: "structured",
+          },
+        },
+        updatedAt: Date.now(),
+      },
+    );
+
+    expect(discordSdkState.editDiscordComponentMessage).toHaveBeenCalledWith(
+      "channel:chan-1",
+      "pending-message-1",
+      expect.objectContaining({ text: expect.stringContaining("Which path should Codex take?") }),
+      expect.objectContaining({ accountId: "default" }),
+    );
   });
 
   it("annotates delayed questionnaire replies so Codex can distinguish them from defaults", async () => {
