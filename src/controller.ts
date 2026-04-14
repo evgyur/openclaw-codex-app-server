@@ -252,6 +252,7 @@ const INBOUND_MEDIA_FALLBACK_MAX_AGE_MS = 10 * 60 * 1000;
 const INBOUND_MEDIA_FALLBACK_MATCH_WINDOW_MS = 3 * 60 * 1000;
 const TELEGRAM_CHIP_API_BASE = process.env.TELEGRAM_CHIP_API_BASE?.trim() || "http://127.0.0.1:8080";
 const TELEGRAM_CHIP_REQUEST_TIMEOUT_MS = 8_000;
+const TELEGRAM_REPLY_CONTEXT_PAGE_SIZE = 80;
 const TELEGRAM_RECOVERY_CONTEXT_PAGE_SIZE = 60;
 const TELEGRAM_RECOVERY_CONTEXT_MAX_MESSAGES = 8;
 const TELEGRAM_RECOVERY_CONTEXT_MAX_CHARS = 4_000;
@@ -1446,43 +1447,6 @@ function normalizePromptForTaskGoal(prompt: string): string {
   return prompt.replace(/\s+/g, " ").trim();
 }
 
-function getNonEmptyPromptLines(prompt: string): string[] {
-  return prompt
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-}
-
-function isSyntheticTaskGoalPrompt(prompt: string): boolean {
-  const firstLine = getNonEmptyPromptLines(prompt)[0] ?? "";
-  return /^resume the current codex task from the existing long-lived thread context\b/i.test(firstLine) ||
-    /^the previous codex (status|execution) thread became stale\. resume the task on this fresh thread using the saved task card\b/i.test(firstLine);
-}
-
-function extractEmbeddedTaskGoal(prompt: string): string | undefined {
-  if (!isSyntheticTaskGoalPrompt(prompt)) {
-    return undefined;
-  }
-  const goalLine = getNonEmptyPromptLines(prompt).find((line) => /\bgoal:\s*/i.test(line));
-  const goal = goalLine?.replace(/^.*?\bgoal:\s*/i, "").trim();
-  return goal || undefined;
-}
-
-function sanitizeTaskGoal(goal: string | undefined): string | undefined {
-  let current = goal?.trim();
-  if (!current) {
-    return undefined;
-  }
-  for (let depth = 0; depth < 4; depth += 1) {
-    const extracted = extractEmbeddedTaskGoal(current);
-    if (!extracted || extracted === current) {
-      break;
-    }
-    current = extracted;
-  }
-  return current;
-}
-
 function isContinuationPrompt(prompt: string): boolean {
   const normalized = normalizePromptForTaskGoal(prompt).toLowerCase();
   return /^(continue|continue please|go on|keep going|proceed|retry|давай|сделай|погнали|продолжай|дальше|ну давай|да сделай)[.!?]*$/.test(
@@ -1491,10 +1455,6 @@ function isContinuationPrompt(prompt: string): boolean {
 }
 
 function deriveTaskGoalFromPrompt(prompt: string): string | undefined {
-  const embeddedGoal = extractEmbeddedTaskGoal(prompt);
-  if (embeddedGoal) {
-    return embeddedGoal;
-  }
   const normalized = normalizePromptForTaskGoal(prompt);
   if (!normalized) {
     return undefined;
@@ -1506,9 +1466,6 @@ function deriveTaskGoalFromPrompt(prompt: string): string | undefined {
     return undefined;
   }
   if (/^resume the current codex task\b/i.test(normalized)) {
-    return undefined;
-  }
-  if (isSyntheticTaskGoalPrompt(prompt)) {
     return undefined;
   }
   return summarizeTextForLog(normalized, 140);
@@ -1674,9 +1631,8 @@ function isPendingInputTaskState(taskState: TaskCardState | undefined): boolean 
 
 function buildResumeTaskPrompt(taskState: TaskCardState | undefined): string {
   const lines = ["Resume the current Codex task from the existing long-lived thread context."];
-  const sanitizedGoal = sanitizeTaskGoal(taskState?.goal);
-  if (sanitizedGoal) {
-    lines.push(`Goal: ${sanitizedGoal}`);
+  if (taskState?.goal?.trim()) {
+    lines.push(`Goal: ${taskState.goal.trim()}`);
   }
   if (taskState?.checkpoint?.summary?.trim()) {
     lines.push(`Checkpoint: ${taskState.checkpoint.summary.trim()}`);
@@ -1704,9 +1660,8 @@ function buildFreshThreadRecoveryPrompt(
   const lines = [
     "The previous Codex status thread became stale. Resume the task on this fresh thread using the saved task card.",
   ];
-  const sanitizedGoal = sanitizeTaskGoal(taskState?.goal);
-  if (sanitizedGoal) {
-    lines.push(`Goal: ${sanitizedGoal}`);
+  if (taskState?.goal?.trim()) {
+    lines.push(`Goal: ${taskState.goal.trim()}`);
   }
   if (taskState?.checkpoint?.summary?.trim()) {
     lines.push(`Checkpoint: ${taskState.checkpoint.summary.trim()}`);
@@ -1860,14 +1815,13 @@ function mergeTaskState(
 ): TaskCardState | undefined {
   const next: TaskCardState = {
     ...existing,
-    ...(existing?.goal ? { goal: sanitizeTaskGoal(existing.goal) ?? existing.goal } : {}),
     updatedAt: Date.now(),
   };
   if (updates.goal !== undefined) {
     if (updates.goal === null) {
       delete next.goal;
     } else {
-      next.goal = sanitizeTaskGoal(updates.goal) ?? updates.goal;
+      next.goal = updates.goal;
     }
   }
   if (updates.stage !== undefined) {
@@ -2166,7 +2120,6 @@ export class CodexPluginController {
     }
     this.startPromise = (async () => {
       await this.store.load();
-      await this.sanitizeStoredTaskGoals();
       await this.client.logStartupProbe().catch(() => undefined);
       this.stopping = false;
       this.started = true;
@@ -2182,25 +2135,6 @@ export class CodexPluginController {
       await this.startPromise;
     } finally {
       this.startPromise = null;
-    }
-  }
-
-  private async sanitizeStoredTaskGoals(): Promise<void> {
-    for (const binding of this.store.listBindings()) {
-      const currentGoal = binding.taskState?.goal;
-      const sanitizedGoal = sanitizeTaskGoal(currentGoal);
-      if (!currentGoal || !sanitizedGoal || sanitizedGoal === currentGoal || !binding.taskState) {
-        continue;
-      }
-      await this.store.upsertBinding({
-        ...binding,
-        taskState: {
-          ...binding.taskState,
-          goal: sanitizedGoal,
-          updatedAt: Date.now(),
-        },
-        updatedAt: Date.now(),
-      });
     }
   }
 
@@ -2434,6 +2368,7 @@ export class CodexPluginController {
     conversationId?: string;
     parentConversationId?: string;
     threadId?: string | number;
+    messageId?: string;
     isGroup?: boolean;
     media?: PluginInboundMedia[];
     metadata?: Record<string, unknown>;
@@ -2448,6 +2383,10 @@ export class CodexPluginController {
         return { handled: false };
       }
       const input = await buildInboundTurnInput(event);
+      const replyContextText = await this.loadInboundReplyContext(conversation, event);
+      if (replyContextText) {
+        input.unshift({ type: "text", text: replyContextText });
+      }
       const activeKey = buildConversationKey(conversation);
       const active = this.activeRuns.get(activeKey);
       if (active) {
@@ -8227,6 +8166,133 @@ export class CodexPluginController {
     ];
   }
 
+  private buildReplyContextText(params: {
+    replyToId?: string;
+    replyToSender?: string;
+    replyToBody?: string;
+  }): string | undefined {
+    const replyToId = params.replyToId?.trim();
+    const replyToSender = params.replyToSender?.trim();
+    const replyToBody = this.trimReplayText(params.replyToBody?.replace(/\s+/gu, " ").trim(), 600);
+    if (!replyToId && !replyToSender && !replyToBody) {
+      return undefined;
+    }
+    const lines = [
+      "[Reply context]",
+      "The user is replying to a previous Telegram message.",
+    ];
+    if (replyToSender) {
+      lines.push(`Original sender: ${replyToSender}`);
+    }
+    if (replyToId) {
+      lines.push(`Original message id: ${replyToId}`);
+    }
+    if (replyToBody) {
+      lines.push("Original message preview:");
+      lines.push(replyToBody);
+    }
+    lines.push("[/Reply context]");
+    return lines.join("\n");
+  }
+
+  private async loadInboundReplyContext(
+    conversation: ConversationTarget,
+    event: {
+      messageId?: string;
+      metadata?: Record<string, unknown>;
+    },
+  ): Promise<string | undefined> {
+    if (!isTelegramChannel(conversation.channel)) {
+      return undefined;
+    }
+    const metadata = asRecord(event.metadata);
+    const directReplyContext = this.buildReplyContextText({
+      replyToId:
+        typeof metadata?.replyToId === "string"
+          ? metadata.replyToId
+          : typeof metadata?.reply_to_id === "string"
+            ? metadata.reply_to_id
+            : undefined,
+      replyToSender:
+        typeof metadata?.replyToSender === "string"
+          ? metadata.replyToSender
+          : typeof metadata?.reply_to_sender === "string"
+            ? metadata.reply_to_sender
+            : undefined,
+      replyToBody:
+        typeof metadata?.replyToBody === "string"
+          ? metadata.replyToBody
+          : typeof metadata?.reply_to_body === "string"
+            ? metadata.reply_to_body
+            : undefined,
+    });
+    if (directReplyContext) {
+      return directReplyContext;
+    }
+    const inboundMessageId = event.messageId?.trim();
+    if (!inboundMessageId || !/^\d+$/u.test(inboundMessageId)) {
+      return undefined;
+    }
+    const chatId = normalizeTelegramChatId(
+      conversation.parentConversationId ?? conversation.conversationId,
+    );
+    if (!chatId) {
+      return undefined;
+    }
+    const requestUrl = new URL(
+      `/chats/${encodeURIComponent(chatId)}/messages`,
+      TELEGRAM_CHIP_API_BASE,
+    );
+    requestUrl.searchParams.set("page", "1");
+    requestUrl.searchParams.set("page_size", String(TELEGRAM_REPLY_CONTEXT_PAGE_SIZE));
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => {
+      abortController.abort();
+    }, TELEGRAM_CHIP_REQUEST_TIMEOUT_MS);
+    try {
+      const response = await fetch(requestUrl.toString(), {
+        method: "GET",
+        signal: abortController.signal,
+      });
+      const responseText = await response.text();
+      if (!response.ok) {
+        throw new Error(
+          `status=${response.status} body=${this.trimReplayText(responseText, 400) ?? "<empty>"}`,
+        );
+      }
+      const parsed = responseText.trim()
+        ? (JSON.parse(responseText) as TelegramChipApiResponse)
+        : undefined;
+      if (!parsed?.success) {
+        const errorText =
+          typeof parsed?.error === "string" && parsed.error.trim()
+            ? parsed.error.trim()
+            : responseText.trim() || "telegram-chip returned an empty response";
+        throw new Error(errorText);
+      }
+      const rawMessages = typeof parsed.data === "string" ? parsed.data : "";
+      const messages = parseTelegramChipMessageSummaryList(rawMessages);
+      const currentMessage = messages.find((message) => String(message.id) === inboundMessageId);
+      const replyToId = currentMessage?.replyTo;
+      if (!replyToId) {
+        return undefined;
+      }
+      const replyTarget = messages.find((message) => message.id === replyToId);
+      return this.buildReplyContextText({
+        replyToId: String(replyToId),
+        replyToSender: replyTarget?.sender,
+        replyToBody: replyTarget?.text,
+      });
+    } catch (error) {
+      this.api.logger.warn?.(
+        `codex telegram reply context load failed ${this.formatConversationForLog(conversation)} message=${inboundMessageId}: ${String(error)}`,
+      );
+      return undefined;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   private async loadTelegramRecoveryContext(
     conversation: ConversationTarget,
   ): Promise<string | undefined> {
@@ -9176,7 +9242,7 @@ export class CodexPluginController {
     return stats;
   }
 
-  private async recoverStaleExecutingBinding(params: {
+  private async recoverStaleVerifyingBinding(params: {
     binding: StoredBinding;
     conversation: ConversationTarget;
     foreignTopicRefs: string[];
@@ -9188,11 +9254,11 @@ export class CodexPluginController {
     this.recentAutoRecoveries.set(conversationKey, Date.now());
     const profile = this.getPermissionsMode(binding);
     this.api.logger.info?.(
-      `codex auto-recovering stale executing binding ${this.formatConversationForLog(conversation)} thread=${binding.threadId} rolloutCount=${rolloutCount} rolloutIdleMs=${rolloutIdleMs} foreignTopics=${foreignTopicRefs.join(",") || "<none>"}`,
+      `codex auto-recovering stale verifying binding ${this.formatConversationForLog(conversation)} thread=${binding.threadId} rolloutCount=${rolloutCount} rolloutIdleMs=${rolloutIdleMs} foreignTopics=${foreignTopicRefs.join(",") || "<none>"}`,
     );
     await this.sendText(
       conversation,
-      "Detected a stale Codex execution thread. Rebinding this topic to a fresh thread and continuing from the saved task card.",
+      "Detected a stale Codex status thread. Rebinding this topic to a fresh thread and continuing from the saved task card.",
     );
     const created = await this.client.startThread({
       profile,
@@ -9237,7 +9303,7 @@ export class CodexPluginController {
       if (this.activeRuns.has(conversationKey) || this.store.getPendingRequestByConversation(conversation)) {
         continue;
       }
-      if (taskState?.stage !== "executing" || taskState.verification?.status !== "unverified") {
+      if (taskState?.stage !== "verifying" || taskState.verification?.status !== "unverified") {
         continue;
       }
       const lastRecoveredAt = this.recentAutoRecoveries.get(conversationKey) ?? 0;
@@ -9266,7 +9332,7 @@ export class CodexPluginController {
       if (!lowContextRemaining && !heavyRolloutFanout && foreignTopicRefs.length === 0) {
         continue;
       }
-      await this.recoverStaleExecutingBinding({
+      await this.recoverStaleVerifyingBinding({
         binding,
         conversation,
         foreignTopicRefs,
@@ -9274,7 +9340,7 @@ export class CodexPluginController {
         rolloutIdleMs,
       }).catch((error) => {
         this.api.logger.warn(
-          `codex stale executing auto-recovery failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
+          `codex stale verifying auto-recovery failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
         );
       });
     }

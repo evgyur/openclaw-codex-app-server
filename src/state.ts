@@ -23,6 +23,7 @@ type PutCallbackInput =
       requestedModel?: string;
       requestedFast?: boolean;
       requestedYolo?: boolean;
+      preserveTaskState?: boolean;
       token?: string;
       ttlMs?: number;
     }
