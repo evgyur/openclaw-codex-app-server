@@ -1446,6 +1446,43 @@ function normalizePromptForTaskGoal(prompt: string): string {
   return prompt.replace(/\s+/g, " ").trim();
 }
 
+function getNonEmptyPromptLines(prompt: string): string[] {
+  return prompt
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function isSyntheticTaskGoalPrompt(prompt: string): boolean {
+  const firstLine = getNonEmptyPromptLines(prompt)[0] ?? "";
+  return /^resume the current codex task from the existing long-lived thread context\b/i.test(firstLine) ||
+    /^the previous codex (status|execution) thread became stale\. resume the task on this fresh thread using the saved task card\b/i.test(firstLine);
+}
+
+function extractEmbeddedTaskGoal(prompt: string): string | undefined {
+  if (!isSyntheticTaskGoalPrompt(prompt)) {
+    return undefined;
+  }
+  const goalLine = getNonEmptyPromptLines(prompt).find((line) => /\bgoal:\s*/i.test(line));
+  const goal = goalLine?.replace(/^.*?\bgoal:\s*/i, "").trim();
+  return goal || undefined;
+}
+
+function sanitizeTaskGoal(goal: string | undefined): string | undefined {
+  let current = goal?.trim();
+  if (!current) {
+    return undefined;
+  }
+  for (let depth = 0; depth < 4; depth += 1) {
+    const extracted = extractEmbeddedTaskGoal(current);
+    if (!extracted || extracted === current) {
+      break;
+    }
+    current = extracted;
+  }
+  return current;
+}
+
 function isContinuationPrompt(prompt: string): boolean {
   const normalized = normalizePromptForTaskGoal(prompt).toLowerCase();
   return /^(continue|continue please|go on|keep going|proceed|retry|давай|сделай|погнали|продолжай|дальше|ну давай|да сделай)[.!?]*$/.test(
@@ -1454,6 +1491,10 @@ function isContinuationPrompt(prompt: string): boolean {
 }
 
 function deriveTaskGoalFromPrompt(prompt: string): string | undefined {
+  const embeddedGoal = extractEmbeddedTaskGoal(prompt);
+  if (embeddedGoal) {
+    return embeddedGoal;
+  }
   const normalized = normalizePromptForTaskGoal(prompt);
   if (!normalized) {
     return undefined;
@@ -1465,6 +1506,9 @@ function deriveTaskGoalFromPrompt(prompt: string): string | undefined {
     return undefined;
   }
   if (/^resume the current codex task\b/i.test(normalized)) {
+    return undefined;
+  }
+  if (isSyntheticTaskGoalPrompt(prompt)) {
     return undefined;
   }
   return summarizeTextForLog(normalized, 140);
@@ -1630,8 +1674,9 @@ function isPendingInputTaskState(taskState: TaskCardState | undefined): boolean 
 
 function buildResumeTaskPrompt(taskState: TaskCardState | undefined): string {
   const lines = ["Resume the current Codex task from the existing long-lived thread context."];
-  if (taskState?.goal?.trim()) {
-    lines.push(`Goal: ${taskState.goal.trim()}`);
+  const sanitizedGoal = sanitizeTaskGoal(taskState?.goal);
+  if (sanitizedGoal) {
+    lines.push(`Goal: ${sanitizedGoal}`);
   }
   if (taskState?.checkpoint?.summary?.trim()) {
     lines.push(`Checkpoint: ${taskState.checkpoint.summary.trim()}`);
@@ -1659,8 +1704,9 @@ function buildFreshThreadRecoveryPrompt(
   const lines = [
     "The previous Codex status thread became stale. Resume the task on this fresh thread using the saved task card.",
   ];
-  if (taskState?.goal?.trim()) {
-    lines.push(`Goal: ${taskState.goal.trim()}`);
+  const sanitizedGoal = sanitizeTaskGoal(taskState?.goal);
+  if (sanitizedGoal) {
+    lines.push(`Goal: ${sanitizedGoal}`);
   }
   if (taskState?.checkpoint?.summary?.trim()) {
     lines.push(`Checkpoint: ${taskState.checkpoint.summary.trim()}`);
@@ -1814,13 +1860,14 @@ function mergeTaskState(
 ): TaskCardState | undefined {
   const next: TaskCardState = {
     ...existing,
+    ...(existing?.goal ? { goal: sanitizeTaskGoal(existing.goal) ?? existing.goal } : {}),
     updatedAt: Date.now(),
   };
   if (updates.goal !== undefined) {
     if (updates.goal === null) {
       delete next.goal;
     } else {
-      next.goal = updates.goal;
+      next.goal = sanitizeTaskGoal(updates.goal) ?? updates.goal;
     }
   }
   if (updates.stage !== undefined) {
@@ -2119,6 +2166,7 @@ export class CodexPluginController {
     }
     this.startPromise = (async () => {
       await this.store.load();
+      await this.sanitizeStoredTaskGoals();
       await this.client.logStartupProbe().catch(() => undefined);
       this.stopping = false;
       this.started = true;
@@ -2134,6 +2182,25 @@ export class CodexPluginController {
       await this.startPromise;
     } finally {
       this.startPromise = null;
+    }
+  }
+
+  private async sanitizeStoredTaskGoals(): Promise<void> {
+    for (const binding of this.store.listBindings()) {
+      const currentGoal = binding.taskState?.goal;
+      const sanitizedGoal = sanitizeTaskGoal(currentGoal);
+      if (!currentGoal || !sanitizedGoal || sanitizedGoal === currentGoal || !binding.taskState) {
+        continue;
+      }
+      await this.store.upsertBinding({
+        ...binding,
+        taskState: {
+          ...binding.taskState,
+          goal: sanitizedGoal,
+          updatedAt: Date.now(),
+        },
+        updatedAt: Date.now(),
+      });
     }
   }
 
@@ -2520,6 +2587,62 @@ export class CodexPluginController {
     return null;
   }
 
+  private hydrateConversationTargetFromHookSession(
+    event: { sessionKey?: string },
+    context: Record<string, unknown>,
+  ): ConversationTarget | null {
+    const sessionKey = typeof event.sessionKey === "string" ? event.sessionKey.trim() : "";
+    if (!sessionKey) {
+      return null;
+    }
+    const channelId = typeof context.channelId === "string" ? context.channelId.trim().toLowerCase() : "";
+    if (!channelId) {
+      return null;
+    }
+    const accountId = typeof context.accountId === "string" && context.accountId.trim()
+      ? context.accountId.trim()
+      : "default";
+    const bindingsApi = (this.api.runtime.channel.bindings as {
+      listBySession?: (targetSessionKey: string) => Array<{
+        conversation?: {
+          channel?: string;
+          accountId?: string;
+          conversationId?: string;
+          parentConversationId?: string;
+        };
+      }>;
+    } | undefined);
+    const bindings = bindingsApi?.listBySession?.(sessionKey) ?? [];
+    const binding = bindings.find((entry) => {
+      const conversation = entry.conversation;
+      return conversation?.channel === channelId && (conversation.accountId?.trim() || "default") === accountId;
+    });
+    const conversation = binding?.conversation;
+    if (!conversation?.conversationId || !conversation.channel) {
+      return null;
+    }
+    if (conversation.channel === "telegram") {
+      const normalized = normalizeTelegramChatId(conversation.conversationId);
+      if (!normalized) {
+        return null;
+      }
+      const topicMatch = /^(.*):topic:(\d+)$/.exec(normalized);
+      return {
+        channel: "telegram",
+        accountId: conversation.accountId?.trim() || accountId,
+        conversationId: normalized,
+        parentConversationId: conversation.parentConversationId?.trim() || topicMatch?.[1],
+        threadId: topicMatch?.[2] ? Number(topicMatch[2]) : undefined,
+      };
+    }
+    return {
+      channel: conversation.channel,
+      accountId: conversation.accountId?.trim() || accountId,
+      conversationId: conversation.conversationId,
+      parentConversationId: conversation.parentConversationId?.trim() || undefined,
+    };
+  }
+
   private pruneProcessedAudioHookMessages(now = Date.now()): void {
     for (const [key, seenAt] of this.processedAudioHookMessages) {
       if (now - seenAt > 10 * 60_000) {
@@ -2549,7 +2672,9 @@ export class CodexPluginController {
     if (!transcript) {
       return;
     }
-    const conversation = this.buildConversationTargetFromHookContext(context);
+    const conversationFromContext = this.buildConversationTargetFromHookContext(context);
+    const conversationFromSession = this.hydrateConversationTargetFromHookSession(event, context);
+    const conversation = conversationFromSession ?? conversationFromContext;
     if (!conversation) {
       return;
     }
@@ -8993,7 +9118,7 @@ export class CodexPluginController {
     return stats;
   }
 
-  private async recoverStaleVerifyingBinding(params: {
+  private async recoverStaleExecutingBinding(params: {
     binding: StoredBinding;
     conversation: ConversationTarget;
     foreignTopicRefs: string[];
@@ -9005,11 +9130,11 @@ export class CodexPluginController {
     this.recentAutoRecoveries.set(conversationKey, Date.now());
     const profile = this.getPermissionsMode(binding);
     this.api.logger.info?.(
-      `codex auto-recovering stale verifying binding ${this.formatConversationForLog(conversation)} thread=${binding.threadId} rolloutCount=${rolloutCount} rolloutIdleMs=${rolloutIdleMs} foreignTopics=${foreignTopicRefs.join(",") || "<none>"}`,
+      `codex auto-recovering stale executing binding ${this.formatConversationForLog(conversation)} thread=${binding.threadId} rolloutCount=${rolloutCount} rolloutIdleMs=${rolloutIdleMs} foreignTopics=${foreignTopicRefs.join(",") || "<none>"}`,
     );
     await this.sendText(
       conversation,
-      "Detected a stale Codex status thread. Rebinding this topic to a fresh thread and continuing from the saved task card.",
+      "Detected a stale Codex execution thread. Rebinding this topic to a fresh thread and continuing from the saved task card.",
     );
     const created = await this.client.startThread({
       profile,
@@ -9054,7 +9179,7 @@ export class CodexPluginController {
       if (this.activeRuns.has(conversationKey) || this.store.getPendingRequestByConversation(conversation)) {
         continue;
       }
-      if (taskState?.stage !== "verifying" || taskState.verification?.status !== "unverified") {
+      if (taskState?.stage !== "executing" || taskState.verification?.status !== "unverified") {
         continue;
       }
       const lastRecoveredAt = this.recentAutoRecoveries.get(conversationKey) ?? 0;
@@ -9083,7 +9208,7 @@ export class CodexPluginController {
       if (!lowContextRemaining && !heavyRolloutFanout && foreignTopicRefs.length === 0) {
         continue;
       }
-      await this.recoverStaleVerifyingBinding({
+      await this.recoverStaleExecutingBinding({
         binding,
         conversation,
         foreignTopicRefs,
@@ -9091,7 +9216,7 @@ export class CodexPluginController {
         rolloutIdleMs,
       }).catch((error) => {
         this.api.logger.warn(
-          `codex stale verifying auto-recovery failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
+          `codex stale executing auto-recovery failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
         );
       });
     }
