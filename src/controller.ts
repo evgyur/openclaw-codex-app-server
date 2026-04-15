@@ -720,8 +720,18 @@ function extractInboundMetadataMedia(metadata?: Record<string, unknown>): Plugin
   if (!metadata) {
     return [];
   }
-  const mediaPaths = asStringArray(metadata.mediaPaths).concat(asStringArray(metadata.mediaPath));
-  const mediaTypes = asStringArray(metadata.mediaTypes).concat(asStringArray(metadata.mediaType));
+  const mediaPaths = asStringArray(metadata.mediaPaths)
+    .concat(asStringArray(metadata.mediaPath))
+    .concat(asStringArray(metadata.MediaPaths))
+    .concat(asStringArray(metadata.MediaPath))
+    .concat(asStringArray(metadata.mediaUrls))
+    .concat(asStringArray(metadata.mediaUrl))
+    .concat(asStringArray(metadata.MediaUrls))
+    .concat(asStringArray(metadata.MediaUrl));
+  const mediaTypes = asStringArray(metadata.mediaTypes)
+    .concat(asStringArray(metadata.mediaType))
+    .concat(asStringArray(metadata.MediaTypes))
+    .concat(asStringArray(metadata.MediaType));
   const count = Math.max(mediaPaths.length, mediaTypes.length);
   const results: PluginInboundMedia[] = [];
   for (let index = 0; index < count; index += 1) {
@@ -1178,6 +1188,18 @@ function formatBindingPreferencesForLog(binding: StoredBinding | null): string {
   ].join(" ");
 }
 
+function canonicalModelId(value?: string): string {
+  const trimmed = value?.trim().toLowerCase() ?? "";
+  if (!trimmed) {
+    return "";
+  }
+  return trimmed.includes("/") ? (trimmed.split("/").at(-1) ?? trimmed) : trimmed;
+}
+
+function isAutoCompactTargetModel(model?: string): boolean {
+  return canonicalModelId(model) === "gpt-5.4";
+}
+
 function buildPermissionsUnavailableNote(): string {
   return "Permissions note: Full Access is unavailable in the current Codex Desktop session, so this thread remains in Default mode.";
 }
@@ -1194,6 +1216,9 @@ const COMPACT_PROGRESS_DELAY_MS = 12_000;
 const COMPACT_PROGRESS_INTERVAL_MS = 15_000;
 const STARTUP_TASK_RECOVERY_WINDOW_MS = 15 * 60_000;
 const BINDING_RECONCILE_INTERVAL_MS = 5 * 60_000;
+const AUTO_COMPACT_REMAINING_PERCENT_MAX = 35;
+const AUTO_COMPACT_COOLDOWN_MS = 4 * 60 * 60_000;
+const AUTO_COMPACT_FAILURE_COOLDOWN_MS = 15 * 60_000;
 const STALE_VERIFY_ROLLOUT_IDLE_MS = 45 * 60_000;
 const STALE_VERIFY_REMAINING_PERCENT_MAX = 40;
 const STALE_VERIFY_CHILD_ROLLOUT_COUNT_MIN = 8;
@@ -1468,6 +1493,9 @@ function deriveTaskGoalFromPrompt(prompt: string): string | undefined {
   if (/^resume the current codex task\b/i.test(normalized)) {
     return undefined;
   }
+  if (/^the previous codex status thread became stale\b/i.test(normalized)) {
+    return undefined;
+  }
   return summarizeTextForLog(normalized, 140);
 }
 
@@ -1656,9 +1684,14 @@ function buildResumeTaskPrompt(taskState: TaskCardState | undefined): string {
 function buildFreshThreadRecoveryPrompt(
   taskState: TaskCardState | undefined,
   foreignTopicRefs: string[] = [],
+  options?: {
+    intro?: string;
+    outro?: string;
+  },
 ): string {
   const lines = [
-    "The previous Codex status thread became stale. Resume the task on this fresh thread using the saved task card.",
+    options?.intro?.trim() ||
+      "The previous Codex status thread became stale. Resume the task on this fresh thread using the saved task card.",
   ];
   if (taskState?.goal?.trim()) {
     lines.push(`Goal: ${taskState.goal.trim()}`);
@@ -1678,7 +1711,10 @@ function buildFreshThreadRecoveryPrompt(
   if (foreignTopicRefs.length > 0) {
     lines.push(`Ignore stale carry-over that references other topics: ${foreignTopicRefs.map((value) => `topic:${value}`).join(", ")}.`);
   }
-  lines.push("Do not rely on the old stale status thread. Reconstruct the real current state, continue the work, and report only fresh progress.");
+  lines.push(
+    options?.outro?.trim() ||
+      "Do not rely on the old stale status thread. Reconstruct the real current state, continue the work, and report only fresh progress.",
+  );
   return lines.join("\n");
 }
 
@@ -2269,6 +2305,80 @@ export class CodexPluginController {
     );
   }
 
+  private shouldRecoverInterruptedTurnOnFreshThread(binding: StoredBinding): boolean {
+    const usage = binding.contextUsage;
+    if (!usage) {
+      return false;
+    }
+    if (typeof usage.remainingTokens === "number") {
+      return usage.remainingTokens <= 0;
+    }
+    if (typeof usage.remainingPercent === "number") {
+      return usage.remainingPercent <= 0;
+    }
+    return typeof usage.totalTokens === "number" &&
+      typeof usage.contextWindow === "number" &&
+      usage.contextWindow > 0 &&
+      usage.totalTokens >= usage.contextWindow;
+  }
+
+  private async recoverInterruptedTurnOnFreshThread(
+    binding: StoredBinding,
+    conversation: ConversationTarget,
+  ): Promise<void> {
+    const profile = this.getPermissionsMode(binding);
+    this.api.logger.info?.(
+      `codex startup recovery rebinding exhausted thread ${this.formatConversationForLog(conversation)} thread=${binding.threadId}`,
+    );
+    await this.sendText(
+      conversation,
+      "Gateway restarted while Codex was working. The previous thread context was full, so continuing on a fresh thread from the saved checkpoint.",
+    );
+    const created = await this.client.startThread({
+      profile,
+      sessionKey: binding.sessionKey,
+      workspaceDir: binding.workspaceDir,
+      model: binding.preferences?.preferredModel?.trim() || undefined,
+    });
+    let rebound = await this.bindConversation(conversation, {
+      sessionKey: binding.sessionKey,
+      threadId: created.threadId,
+      workspaceDir: created.cwd?.trim() || binding.workspaceDir,
+      threadTitle: created.threadName,
+      permissionsMode: profile,
+      preferences: binding.preferences,
+      preserveContextUsage: false,
+    });
+    rebound = await this.upsertTaskState(rebound, {
+      stage: "executing",
+      nextAction: "Wait for Codex to continue from the recovered task card",
+      blocker: null,
+      resumeReason: "Wait for Codex to continue from the recovered task card",
+      lastHeartbeatAt: Date.now(),
+    });
+    const recoveryPrompt = buildFreshThreadRecoveryPrompt(rebound.taskState, [], {
+      intro: "The previous Codex thread hit its context limit before recovery. Resume the task on this fresh thread using the saved task card.",
+      outro: "Do not rely on the exhausted thread transcript. Reconstruct the real current state from the task card, continue the work, and report only fresh progress.",
+    });
+    const recoveryInput = await this.buildRecoveryTurnInput({
+      conversation,
+      prompt: recoveryPrompt,
+    });
+    await this.startTurn({
+      conversation,
+      binding: rebound,
+      workspaceDir: rebound.workspaceDir,
+      prompt: recoveryPrompt,
+      input: recoveryInput,
+      reason: "command",
+      skipProgressKeepalive: true,
+    });
+    const active = this.activeRuns.get(buildConversationKey(conversation));
+    if (active) {
+      this.startRecoveryTurnKeepalive(conversation, rebound, active.handle);
+    }
+  }
+
   private async recoverInterruptedTurnsOnStartup(): Promise<void> {
     const now = Date.now();
     const bindings = this.store.listBindings();
@@ -2286,6 +2396,10 @@ export class CodexPluginController {
       this.api.logger.info?.(
         `codex startup recovery resuming interrupted turn ${this.formatConversationForLog(conversation)} thread=${binding.threadId}`,
       );
+      if (this.shouldRecoverInterruptedTurnOnFreshThread(binding)) {
+        await this.recoverInterruptedTurnOnFreshThread(binding, conversation);
+        continue;
+      }
       const resumePrompt = buildResumeTaskPrompt(binding.taskState);
       const recoveryInput = await this.buildRecoveryTurnInput({
         conversation,
@@ -4533,6 +4647,9 @@ export class CodexPluginController {
     if (!conversation || !binding) {
       return { text: "Bind this conversation to a Codex thread before compacting it." };
     }
+    if (!binding.contextUsage) {
+      return buildPlainReply(this.buildCompactUnavailableText());
+    }
     void this.startCompact({
       conversation,
       binding,
@@ -4543,33 +4660,57 @@ export class CodexPluginController {
   private async startCompact(params: {
     conversation: ConversationTarget;
     binding: StoredBinding;
+    trigger?: "manual" | "automatic";
+    reasonText?: string;
   }): Promise<void> {
-    const { conversation, binding } = params;
+    const { conversation } = params;
+    let binding = params.binding;
     const profile = this.getPermissionsMode(binding);
+    const autoTriggered = params.trigger === "automatic";
+    const startedAt = Date.now();
+    const previousAutoCompactState = binding.autoCompactState;
+    if (autoTriggered) {
+      binding = {
+        ...binding,
+        autoCompactState: {
+          ...binding.autoCompactState,
+          lastTriggeredAt: startedAt,
+          lastThreadId: binding.threadId,
+          lastRemainingPercent: binding.contextUsage?.remainingPercent,
+          lastTotalTokens: binding.contextUsage?.totalTokens,
+        },
+        updatedAt: startedAt,
+      };
+      await this.store.upsertBinding(binding);
+    }
     const typing = await this.startTypingLease(conversation);
     let startingUsage = binding.contextUsage;
     let latestUsage = startingUsage;
     let lastEmittedUsageText = binding.contextUsage ? formatContextUsageText(binding.contextUsage) : undefined;
+    let keepaliveInterval: NodeJS.Timeout | undefined;
+    const progressTimer = setTimeout(() => {
+      void (async () => {
+        const usageText =
+          latestUsage ? formatContextUsageText(latestUsage) : undefined;
+        if (usageText && usageText !== lastEmittedUsageText) {
+          lastEmittedUsageText = usageText;
+        }
+        await this.sendText(
+          conversation,
+          usageText
+            ? `Codex is still compacting.
+Latest context usage: ${usageText}`
+            : "Codex is still compacting.",
+        );
+      })();
+      keepaliveInterval = setInterval(() => {
+        void this.sendText(conversation, "Codex is still compacting.");
+      }, COMPACT_PROGRESS_INTERVAL_MS);
+    }, COMPACT_PROGRESS_DELAY_MS);
     try {
-      let keepaliveInterval: NodeJS.Timeout | undefined;
-      const progressTimer = setTimeout(() => {
-        void (async () => {
-          const usageText =
-            latestUsage ? formatContextUsageText(latestUsage) : undefined;
-          if (usageText && usageText !== lastEmittedUsageText) {
-            lastEmittedUsageText = usageText;
-          }
-          await this.sendText(
-            conversation,
-            usageText
-              ? `Codex is still compacting.\nLatest context usage: ${usageText}`
-              : "Codex is still compacting.",
-          );
-        })();
-        keepaliveInterval = setInterval(() => {
-          void this.sendText(conversation, "Codex is still compacting.");
-        }, COMPACT_PROGRESS_INTERVAL_MS);
-      }, COMPACT_PROGRESS_DELAY_MS);
+      if (params.reasonText?.trim()) {
+        await this.sendText(conversation, params.reasonText.trim());
+      }
       const result = await this.client.compactThread({
         profile,
         sessionKey: binding.sessionKey,
@@ -4584,10 +4725,6 @@ export class CodexPluginController {
           }
         },
       });
-      clearTimeout(progressTimer);
-      if (keepaliveInterval) {
-        clearInterval(keepaliveInterval);
-      }
       await this.sendText(
         conversation,
         [
@@ -4601,17 +4738,73 @@ export class CodexPluginController {
           .filter(Boolean)
           .join("\n"),
       );
-      if (result.usage) {
+      if (result.usage || autoTriggered) {
         await this.store.upsertBinding({
           ...binding,
-          contextUsage: result.usage,
+          contextUsage: result.usage ?? binding.contextUsage,
+          autoCompactState: autoTriggered
+            ? {
+                ...binding.autoCompactState,
+                lastTriggeredAt: startedAt,
+                lastCompletedAt: Date.now(),
+                lastFailedAt: undefined,
+                lastThreadId: binding.threadId,
+                lastRemainingPercent: result.usage?.remainingPercent ?? binding.contextUsage?.remainingPercent,
+                lastTotalTokens: result.usage?.totalTokens ?? binding.contextUsage?.totalTokens,
+              }
+            : binding.autoCompactState,
           updatedAt: Date.now(),
         });
       }
       return;
     } catch (error) {
+      this.api.logger.warn(
+        `codex compact failed ${this.formatConversationForLog(conversation)} thread=${binding.threadId}: ${String(error)}`,
+      );
+      if (isMissingThreadError(error)) {
+        const created = await this.client.startThread({
+          profile,
+          sessionKey: binding.sessionKey,
+          workspaceDir: binding.workspaceDir,
+          model: binding.preferences?.preferredModel?.trim() || undefined,
+        });
+        await this.bindConversation(conversation, {
+          sessionKey: binding.sessionKey,
+          threadId: created.threadId,
+          workspaceDir: created.cwd?.trim() || binding.workspaceDir,
+          threadTitle: created.threadName,
+          permissionsMode: profile,
+          preferences: binding.preferences,
+          preserveContextUsage: false,
+        });
+        await this.sendText(
+          conversation,
+          autoTriggered
+            ? "Codex lost the previous thread during auto-compaction, so I rebound this conversation to a fresh Codex thread. Send the next message in this topic before trying Compact again."
+            : "Codex lost the previous thread during compaction, so I rebound this conversation to a fresh Codex thread. Send the next message in this topic before trying Compact again.",
+        );
+        return;
+      }
+      if (autoTriggered) {
+        await this.store.upsertBinding({
+          ...binding,
+          autoCompactState: {
+            ...previousAutoCompactState,
+            lastTriggeredAt: startedAt,
+            lastFailedAt: Date.now(),
+            lastThreadId: binding.threadId,
+            lastRemainingPercent: binding.contextUsage?.remainingPercent,
+            lastTotalTokens: binding.contextUsage?.totalTokens,
+          },
+          updatedAt: Date.now(),
+        }).catch(() => undefined);
+      }
       await this.sendText(conversation, formatFailureText("compact", error));
     } finally {
+      clearTimeout(progressTimer);
+      if (keepaliveInterval) {
+        clearInterval(keepaliveInterval);
+      }
       typing?.stop();
     }
   }
@@ -7423,13 +7616,6 @@ export class CodexPluginController {
         await responders.reply("No Codex binding for this conversation.");
         return;
       }
-      void this.startCompact({
-        conversation: {
-          ...callback.conversation,
-          threadId: responders.conversation.threadId,
-        },
-        binding,
-      });
       const statusCard = await this.buildStatusCard(
         {
           ...callback.conversation,
@@ -7438,8 +7624,26 @@ export class CodexPluginController {
         binding,
         true,
       );
+      if (!binding.contextUsage) {
+        await responders.editPicker({
+          text: `${statusCard.text}
+
+${this.buildCompactUnavailableText()}`,
+          buttons: statusCard.buttons,
+        });
+        return;
+      }
+      void this.startCompact({
+        conversation: {
+          ...callback.conversation,
+          threadId: responders.conversation.threadId,
+        },
+        binding,
+      });
       await responders.editPicker({
-        text: `${statusCard.text}\n\nCompaction started.`,
+        text: `${statusCard.text}
+
+Compaction started.`,
         buttons: statusCard.buttons,
       });
       return;
@@ -8009,6 +8213,66 @@ export class CodexPluginController {
     );
   }
 
+  private async syncTelegramBindingSummary(
+    conversation: ConversationTarget,
+    params: {
+      threadId: string;
+      threadTitle?: string;
+    },
+  ): Promise<void> {
+    if (!isTelegramChannel(conversation.channel)) {
+      return;
+    }
+    const accountId = conversation.accountId?.trim() || "default";
+    const statePath = path.join(
+      process.env.HOME?.trim() || "/home/chip",
+      ".openclaw",
+      "telegram",
+      `thread-bindings-${accountId}.json`,
+    );
+    const raw = await fs.readFile(statePath, "utf8").catch(() => "");
+    if (!raw) {
+      return;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    const root = asRecord(parsed);
+    const bindings = Array.isArray(root?.bindings) ? root.bindings : null;
+    if (!bindings) {
+      return;
+    }
+    const desiredSummary = `Bind this conversation to Codex thread ${params.threadTitle?.trim() || params.threadId}.`;
+    let changed = false;
+    for (const entry of bindings) {
+      const binding = asRecord(entry);
+      if (binding?.conversationId !== conversation.conversationId) {
+        continue;
+      }
+      const metadata = asRecord(binding.metadata);
+      const pluginId = typeof metadata?.pluginId === "string" ? metadata.pluginId.trim() : "";
+      if (pluginId && pluginId !== this.api.id) {
+        continue;
+      }
+      if (metadata?.summary === desiredSummary) {
+        return;
+      }
+      binding.metadata = {
+        ...metadata,
+        summary: desiredSummary,
+      };
+      changed = true;
+    }
+    if (!changed) {
+      return;
+    }
+    await fs.writeFile(statePath, `${JSON.stringify(parsed, null, 2)}
+`, "utf8");
+  }
+
   private async bindConversation(
     conversation: ConversationTarget,
     params: {
@@ -8020,6 +8284,7 @@ export class CodexPluginController {
       pendingPermissionsMode?: PermissionsMode;
       preferences?: ConversationPreferences;
       preserveTaskState?: boolean;
+      preserveContextUsage?: boolean;
     },
   ): Promise<StoredBinding> {
     const existing = this.store.getBinding(conversation);
@@ -8029,6 +8294,7 @@ export class CodexPluginController {
       this.getResolvedRuntimeSessionKey(conversation) ||
       buildConversationSessionKey(conversation);
     const preserveTaskState = params.preserveTaskState ?? true;
+    const preserveContextUsage = params.preserveContextUsage ?? true;
     const record: StoredBinding = {
       conversation: {
         channel: conversation.channel,
@@ -8045,12 +8311,18 @@ export class CodexPluginController {
         params.threadTitle ??
         (existing?.threadId === params.threadId ? existing.threadTitle : undefined),
       pinnedBindingMessage: existing?.pinnedBindingMessage,
-      contextUsage: existing?.contextUsage,
+      contextUsage: preserveContextUsage ? existing?.contextUsage : undefined,
+      autoCompactState:
+        existing?.threadId === params.threadId ? existing.autoCompactState : undefined,
       preferences: params.preferences ?? existing?.preferences,
       taskState: preserveTaskState ? existing?.taskState : undefined,
       updatedAt: Date.now(),
     };
     await this.store.upsertBinding(record);
+    await this.syncTelegramBindingSummary(conversation, {
+      threadId: params.threadId,
+      threadTitle: params.threadTitle,
+    }).catch(() => undefined);
     return record;
   }
 
@@ -8658,6 +8930,10 @@ export class CodexPluginController {
     return lines.join("\n");
   }
 
+  private buildCompactUnavailableText(): string {
+    return "This Codex thread was rebound to a fresh thread and has no materialized context yet. Send one normal message in this topic before trying Compact again.";
+  }
+
   private async buildPlanDelivery(
     plan: NonNullable<import("./types.js").TurnResult["planArtifact"]>,
   ): Promise<PlanDelivery> {
@@ -9161,6 +9437,67 @@ export class CodexPluginController {
     this.bindingReconcileInterval.unref?.();
   }
 
+  private shouldAutoCompactBinding(binding: StoredBinding, now = Date.now()): boolean {
+    const remainingPercent = binding.contextUsage?.remainingPercent;
+    if (typeof remainingPercent !== "number") {
+      return false;
+    }
+    if (remainingPercent > AUTO_COMPACT_REMAINING_PERCENT_MAX) {
+      return false;
+    }
+    const lastTriggeredAt = binding.autoCompactState?.lastTriggeredAt ?? 0;
+    if (lastTriggeredAt && now - lastTriggeredAt < COMPACT_PROGRESS_INTERVAL_MS) {
+      return false;
+    }
+    const lastCompletedAt = binding.autoCompactState?.lastCompletedAt ?? 0;
+    if (lastCompletedAt && now - lastCompletedAt < AUTO_COMPACT_COOLDOWN_MS) {
+      return false;
+    }
+    const lastFailedAt = binding.autoCompactState?.lastFailedAt ?? 0;
+    if (lastFailedAt && now - lastFailedAt < AUTO_COMPACT_FAILURE_COOLDOWN_MS) {
+      return false;
+    }
+    return true;
+  }
+
+  private buildAutoCompactReasonText(binding: StoredBinding, model: string): string {
+    const usageText = binding.contextUsage ? formatContextUsageText(binding.contextUsage) : undefined;
+    return [
+      `Context usage dropped to ${binding.contextUsage?.remainingPercent}% remaining on ${model}. Compacting automatically before the thread fills.`,
+      usageText ? `Current context usage: ${usageText}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  private async maybeAutoCompactBinding(params: {
+    binding: StoredBinding;
+    conversation: ConversationTarget;
+    now?: number;
+  }): Promise<boolean> {
+    const { binding, conversation } = params;
+    const now = params.now ?? Date.now();
+    if (!this.shouldAutoCompactBinding(binding, now)) {
+      return false;
+    }
+    const { effectiveState } = await this.readEffectiveThreadState(binding);
+    const model =
+      effectiveState?.model?.trim() || binding.preferences?.preferredModel?.trim() || undefined;
+    if (!model || !isAutoCompactTargetModel(model)) {
+      return false;
+    }
+    this.api.logger.info?.(
+      `codex auto compact ${this.formatConversationForLog(conversation)} thread=${binding.threadId} model=${model} remaining=${binding.contextUsage?.remainingPercent ?? "<unknown>"}`,
+    );
+    await this.startCompact({
+      conversation,
+      binding,
+      trigger: "automatic",
+      reasonText: this.buildAutoCompactReasonText(binding, model),
+    });
+    return true;
+  }
+
   private extractTelegramTopicId(conversationId: string | undefined): string | undefined {
     return /:topic:(\d+)$/.exec(conversationId?.trim() ?? "")?.[1];
   }
@@ -9266,13 +9603,21 @@ export class CodexPluginController {
       workspaceDir: binding.workspaceDir,
       model: binding.preferences?.preferredModel?.trim() || undefined,
     });
-    const rebound = await this.bindConversation(conversation, {
+    let rebound = await this.bindConversation(conversation, {
       sessionKey: binding.sessionKey,
       threadId: created.threadId,
       workspaceDir: created.cwd?.trim() || binding.workspaceDir,
       threadTitle: created.threadName,
       permissionsMode: profile,
       preferences: binding.preferences,
+      preserveContextUsage: false,
+    });
+    rebound = await this.upsertTaskState(rebound, {
+      stage: "executing",
+      nextAction: "Wait for Codex to continue from the recovered task card",
+      blocker: null,
+      resumeReason: "Wait for Codex to continue from the recovered task card",
+      lastHeartbeatAt: Date.now(),
     });
     const recoveryPrompt = buildFreshThreadRecoveryPrompt(rebound.taskState, foreignTopicRefs);
     const recoveryInput = await this.buildRecoveryTurnInput({
@@ -9303,44 +9648,50 @@ export class CodexPluginController {
       if (this.activeRuns.has(conversationKey) || this.store.getPendingRequestByConversation(conversation)) {
         continue;
       }
-      if (taskState?.stage !== "verifying" || taskState.verification?.status !== "unverified") {
-        continue;
+      if (taskState?.stage === "verifying" && taskState.verification?.status === "unverified") {
+        const lastRecoveredAt = this.recentAutoRecoveries.get(conversationKey) ?? 0;
+        if (now - lastRecoveredAt >= STALE_VERIFY_AUTORECOVER_COOLDOWN_MS) {
+          const rollout = rolloutStats.get(binding.threadId);
+          const rolloutCount = rollout?.count ?? 0;
+          const rolloutIdleMs = rollout?.latestAt ? now - rollout.latestAt : Number.POSITIVE_INFINITY;
+          if (rolloutIdleMs >= STALE_VERIFY_ROLLOUT_IDLE_MS) {
+            const currentTopicId = this.extractTelegramTopicId(binding.conversation.conversationId);
+            const foreignTopicRefs = this.extractForeignTopicRefs(
+              [
+                taskState.latestEvidence,
+                taskState.lastRunSummary,
+                taskState.checkpoint?.summary,
+                taskState.resumeReason,
+              ],
+              currentTopicId,
+            );
+            const lowContextRemaining = typeof binding.contextUsage?.remainingPercent === "number" &&
+              binding.contextUsage.remainingPercent <= STALE_VERIFY_REMAINING_PERCENT_MAX;
+            const heavyRolloutFanout = rolloutCount >= STALE_VERIFY_CHILD_ROLLOUT_COUNT_MIN;
+            if (lowContextRemaining || heavyRolloutFanout || foreignTopicRefs.length > 0) {
+              await this.recoverStaleVerifyingBinding({
+                binding,
+                conversation,
+                foreignTopicRefs,
+                rolloutCount,
+                rolloutIdleMs,
+              }).catch((error) => {
+                this.api.logger.warn(
+                  `codex stale verifying auto-recovery failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
+                );
+              });
+              continue;
+            }
+          }
+        }
       }
-      const lastRecoveredAt = this.recentAutoRecoveries.get(conversationKey) ?? 0;
-      if (now - lastRecoveredAt < STALE_VERIFY_AUTORECOVER_COOLDOWN_MS) {
-        continue;
-      }
-      const rollout = rolloutStats.get(binding.threadId);
-      const rolloutCount = rollout?.count ?? 0;
-      const rolloutIdleMs = rollout?.latestAt ? now - rollout.latestAt : Number.POSITIVE_INFINITY;
-      if (rolloutIdleMs < STALE_VERIFY_ROLLOUT_IDLE_MS) {
-        continue;
-      }
-      const currentTopicId = this.extractTelegramTopicId(binding.conversation.conversationId);
-      const foreignTopicRefs = this.extractForeignTopicRefs(
-        [
-          taskState.latestEvidence,
-          taskState.lastRunSummary,
-          taskState.checkpoint?.summary,
-          taskState.resumeReason,
-        ],
-        currentTopicId,
-      );
-      const lowContextRemaining = typeof binding.contextUsage?.remainingPercent === "number" &&
-        binding.contextUsage.remainingPercent <= STALE_VERIFY_REMAINING_PERCENT_MAX;
-      const heavyRolloutFanout = rolloutCount >= STALE_VERIFY_CHILD_ROLLOUT_COUNT_MIN;
-      if (!lowContextRemaining && !heavyRolloutFanout && foreignTopicRefs.length === 0) {
-        continue;
-      }
-      await this.recoverStaleVerifyingBinding({
+      await this.maybeAutoCompactBinding({
         binding,
         conversation,
-        foreignTopicRefs,
-        rolloutCount,
-        rolloutIdleMs,
+        now,
       }).catch((error) => {
         this.api.logger.warn(
-          `codex stale verifying auto-recovery failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
+          `codex auto compact failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
         );
       });
     }

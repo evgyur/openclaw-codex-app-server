@@ -1,4 +1,5 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import * as path from "node:path";
 import readline from "node:readline";
 import { promisify } from "node:util";
@@ -1066,12 +1067,39 @@ function normalizeSandboxMode(value: string | undefined): string | undefined {
   return trimmed;
 }
 
-function buildTurnInput(
+const LOCAL_IMAGE_MIME_BY_EXT: Record<string, string> = {
+  ".gif": "image/gif",
+  ".heic": "image/heic",
+  ".heif": "image/heif",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+  ".png": "image/png",
+  ".webp": "image/webp",
+};
+
+function inferLocalImageMimeType(filePath: string): string {
+  return LOCAL_IMAGE_MIME_BY_EXT[path.extname(filePath).toLowerCase()] ?? "image/png";
+}
+
+async function materializeTurnInputItem(
+  item: CodexTurnInputItem,
+): Promise<Record<string, unknown>> {
+  if (item.type === "localImage") {
+    const buffer = await readFile(item.path);
+    return {
+      type: "image",
+      url: `data:${inferLocalImageMimeType(item.path)};base64,${buffer.toString("base64")}`,
+    };
+  }
+  return { ...item };
+}
+
+async function buildTurnInput(
   prompt: string,
   input?: readonly CodexTurnInputItem[],
-): Array<Record<string, unknown>> {
+): Promise<Array<Record<string, unknown>>> {
   if (input?.length) {
-    return input.map((item) => ({ ...item }));
+    return Promise.all(input.map((item) => materializeTurnInputItem(item)));
   }
   return [{ type: "text", text: prompt }];
 }
@@ -1128,7 +1156,7 @@ function buildCollaborationModePayloads(
   ];
 }
 
-function buildTurnStartPayloads(params: {
+async function buildTurnStartPayloads(params: {
   threadId: string;
   prompt: string;
   input?: readonly CodexTurnInputItem[];
@@ -1136,10 +1164,10 @@ function buildTurnStartPayloads(params: {
   serviceTier?: string;
   collaborationMode?: CollaborationMode;
   collaborationFallbackModel?: string;
-}): unknown[] {
+}): Promise<unknown[]> {
   const base: Record<string, unknown> = {
     threadId: params.threadId,
-    input: buildTurnInput(params.prompt, params.input),
+    input: await buildTurnInput(params.prompt, params.input),
   };
   if (params.model?.trim()) {
     base.model = params.model.trim();
@@ -1194,12 +1222,12 @@ function payloadHasCollaborationMode(payload: unknown): boolean {
   );
 }
 
-function buildTurnSteerPayloads(params: {
+async function buildTurnSteerPayloads(params: {
   threadId: string;
   turnId: string;
   text: string;
   input?: readonly CodexTurnInputItem[];
-}): Array<Record<string, unknown>> {
+}): Promise<Array<Record<string, unknown>>> {
   const trimmed = params.text.trim();
   const hasStructuredInput = Boolean(params.input?.length);
   if (!trimmed && !hasStructuredInput) {
@@ -1209,7 +1237,7 @@ function buildTurnSteerPayloads(params: {
     {
       threadId: params.threadId,
       expectedTurnId: params.turnId,
-      input: buildTurnInput(trimmed, params.input),
+      input: await buildTurnInput(trimmed, params.input),
     },
   ];
 }
@@ -3608,7 +3636,7 @@ export class CodexAppServerClient {
         await requestWithFallbacks({
           client,
           methods: [...TURN_STEER_METHODS],
-          payloads: buildTurnSteerPayloads({ threadId, turnId, text: steerText }),
+          payloads: await buildTurnSteerPayloads({ threadId, turnId, text: steerText }),
           timeoutMs: this.settings.requestTimeoutMs,
         });
       } else if (steerText && threadId) {
@@ -3676,7 +3704,7 @@ export class CodexAppServerClient {
           reasoningEffort: params.reasoningEffort?.trim() || threadReasoningEffort,
         });
         const collaborationMode = params.collaborationMode ?? synthesizedDefaultMode;
-        const turnStartPayloads = buildTurnStartPayloads({
+        const turnStartPayloads = await buildTurnStartPayloads({
           threadId,
           prompt: params.prompt,
           input: params.input,
@@ -3809,7 +3837,7 @@ export class CodexAppServerClient {
         await requestWithFallbacks({
           client,
           methods: [...TURN_STEER_METHODS],
-          payloads: buildTurnSteerPayloads({ threadId, turnId, text: trimmed, input }),
+          payloads: await buildTurnSteerPayloads({ threadId, turnId, text: trimmed, input }),
           timeoutMs: this.settings.requestTimeoutMs,
         });
         this.logger.debug(

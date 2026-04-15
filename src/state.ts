@@ -219,6 +219,27 @@ function toConversationKey(target: ConversationTarget): string {
   ].join("::");
 }
 
+function isConversationScopedSingletonCallback(callback: CallbackAction): boolean {
+  switch (callback.kind) {
+    case "toggle-fast":
+    case "resume-task":
+    case "mark-verified":
+    case "clear-task-blocker":
+    case "show-reasoning-picker":
+    case "toggle-permissions":
+    case "compact-thread":
+    case "stop-run":
+    case "refresh-status":
+    case "detach-thread":
+    case "show-skills":
+    case "show-mcp":
+    case "show-model-picker":
+      return true;
+    default:
+      return false;
+  }
+}
+
 function cloneSnapshot(value?: Partial<StoreSnapshot>): StoreSnapshot {
   return {
     version: STORE_VERSION,
@@ -752,9 +773,20 @@ export class PluginStateStore {
                       createdAt: now,
                       expiresAt: now + (callback.ttlMs ?? CALLBACK_TTL_MS),
                     };
-    this.snapshot.callbacks = this.snapshot.callbacks.filter(
-      (current) => current.token !== entry.token,
-    );
+    this.snapshot.callbacks = this.snapshot.callbacks.filter((current) => {
+      if (current.token === entry.token) {
+        return false;
+      }
+      if (
+        isConversationScopedSingletonCallback(current) &&
+        isConversationScopedSingletonCallback(entry) &&
+        current.kind === entry.kind &&
+        toConversationKey(current.conversation) === toConversationKey(entry.conversation)
+      ) {
+        return false;
+      }
+      return true;
+    });
     this.snapshot.callbacks.push(entry);
     await this.save();
     return entry;

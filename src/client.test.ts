@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { __testing, CodexAppServerClient } from "./client.js";
 
@@ -37,14 +40,14 @@ describe("buildCodexChildEnv", () => {
 });
 
 describe("buildTurnStartPayloads", () => {
-  it("uses the canonical v2 turn/start payload for normal turns", () => {
-    expect(
+  it("uses the canonical v2 turn/start payload for normal turns", async () => {
+    await expect(
       __testing.buildTurnStartPayloads({
         threadId: "thread-123",
         prompt: "ship it",
         model: "gpt-5.4",
       }),
-    ).toEqual([
+    ).resolves.toEqual([
       {
         threadId: "thread-123",
         input: [{ type: "text", text: "ship it" }],
@@ -53,35 +56,40 @@ describe("buildTurnStartPayloads", () => {
     ]);
   });
 
-  it("preserves mixed text and local image input when provided", () => {
-    expect(
+  it("materializes mixed text and local image input into a turn-compatible image payload", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-client-test-"));
+    const imagePath = path.join(tempDir, "screenshot.png");
+    fs.writeFileSync(imagePath, Buffer.from("png"));
+    const imageData = fs.readFileSync(imagePath).toString("base64");
+
+    await expect(
       __testing.buildTurnStartPayloads({
         threadId: "thread-123",
         prompt: "describe this screenshot",
         input: [
           { type: "text", text: "describe this screenshot" },
-          { type: "localImage", path: "/tmp/screenshot.png" },
+          { type: "localImage", path: imagePath },
         ],
       }),
-    ).toEqual([
+    ).resolves.toEqual([
       {
         threadId: "thread-123",
         input: [
           { type: "text", text: "describe this screenshot" },
-          { type: "localImage", path: "/tmp/screenshot.png" },
+          { type: "image", url: `data:image/png;base64,${imageData}` },
         ],
       },
     ]);
   });
 
-  it("supports image-only turn input", () => {
-    expect(
+  it("supports image-only turn input", async () => {
+    await expect(
       __testing.buildTurnStartPayloads({
         threadId: "thread-123",
         prompt: "",
         input: [{ type: "image", url: "data:image/png;base64,abc" }],
       }),
-    ).toEqual([
+    ).resolves.toEqual([
       {
         threadId: "thread-123",
         input: [{ type: "image", url: "data:image/png;base64,abc" }],
@@ -89,8 +97,8 @@ describe("buildTurnStartPayloads", () => {
     ]);
   });
 
-  it("keeps collaboration payloads valid by including settings and preserving explicit null developer instructions", () => {
-    expect(
+  it("keeps collaboration payloads valid by including settings and preserving explicit null developer instructions", async () => {
+    await expect(
       __testing.buildTurnStartPayloads({
         threadId: "thread-123",
         prompt: "plan it",
@@ -103,7 +111,7 @@ describe("buildTurnStartPayloads", () => {
           },
         },
       }),
-    ).toEqual([
+    ).resolves.toEqual([
       {
         threadId: "thread-123",
         input: [{ type: "text", text: "plan it" }],
@@ -136,8 +144,8 @@ describe("buildTurnStartPayloads", () => {
     ]);
   });
 
-  it("uses the fallback model to send an explicit default collaboration mode", () => {
-    expect(
+  it("uses the fallback model to send an explicit default collaboration mode", async () => {
+    await expect(
       __testing.buildTurnStartPayloads({
         threadId: "thread-123",
         prompt: "run it",
@@ -149,7 +157,7 @@ describe("buildTurnStartPayloads", () => {
         },
         collaborationFallbackModel: "gpt-5.4",
       }),
-    ).toEqual([
+    ).resolves.toEqual([
       {
         threadId: "thread-123",
         input: [{ type: "text", text: "run it" }],
@@ -181,14 +189,14 @@ describe("buildTurnStartPayloads", () => {
 });
 
 describe("buildTurnSteerPayloads", () => {
-  it("uses expectedTurnId plus text input for turn/steer", () => {
-    expect(
+  it("uses expectedTurnId plus text input for turn/steer", async () => {
+    await expect(
       __testing.buildTurnSteerPayloads({
         threadId: "thread-123",
         turnId: "turn-456",
         text: "continue",
       }),
-    ).toEqual([
+    ).resolves.toEqual([
       {
         threadId: "thread-123",
         expectedTurnId: "turn-456",
@@ -197,24 +205,29 @@ describe("buildTurnSteerPayloads", () => {
     ]);
   });
 
-  it("preserves structured image input for turn/steer", () => {
-    expect(
+  it("materializes structured image input for turn/steer", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-client-test-"));
+    const imagePath = path.join(tempDir, "screenshot.png");
+    fs.writeFileSync(imagePath, Buffer.from("png"));
+    const imageData = fs.readFileSync(imagePath).toString("base64");
+
+    await expect(
       __testing.buildTurnSteerPayloads({
         threadId: "thread-123",
         turnId: "turn-456",
         text: "describe this",
         input: [
           { type: "text", text: "describe this" },
-          { type: "localImage", path: "/tmp/screenshot.png" },
+          { type: "localImage", path: imagePath },
         ],
       }),
-    ).toEqual([
+    ).resolves.toEqual([
       {
         threadId: "thread-123",
         expectedTurnId: "turn-456",
         input: [
           { type: "text", text: "describe this" },
-          { type: "localImage", path: "/tmp/screenshot.png" },
+          { type: "image", url: `data:image/png;base64,${imageData}` },
         ],
       },
     ]);

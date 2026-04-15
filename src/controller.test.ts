@@ -4110,6 +4110,60 @@ describe("Discord controller flows", () => {
     );
   });
 
+  it("supports Telegram photo captions when inbound metadata uses MsgContext-style media fields", async () => {
+    const { controller, stateDir } = await createControllerHarness();
+    const imagePath = path.join(stateDir, "tmp", "caption-photo.jpg");
+    fs.mkdirSync(path.dirname(imagePath), { recursive: true });
+    fs.writeFileSync(imagePath, "jpg");
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: TEST_TELEGRAM_PEER_ID,
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      updatedAt: Date.now(),
+    });
+    const startTurn = vi.fn(() => ({
+      result: Promise.resolve({
+        threadId: "thread-1",
+        text: "described",
+      }),
+      getThreadId: () => "thread-1",
+      queueMessage: vi.fn(async () => true),
+      interrupt: vi.fn(async () => {}),
+      isAwaitingInput: () => false,
+      submitPendingInput: vi.fn(async () => false),
+      submitPendingInputPayload: vi.fn(async () => false),
+    }));
+    (controller as any).client.startTurn = startTurn;
+
+    const result = await controller.handleInboundClaim({
+      content: "What is on this screenshot?",
+      channel: "telegram",
+      accountId: "default",
+      conversationId: TEST_TELEGRAM_PEER_ID,
+      isGroup: false,
+      metadata: {
+        MediaPaths: [imagePath],
+        MediaTypes: ["image/jpeg"],
+      },
+    });
+
+    expect(result).toEqual({ handled: true });
+    expect(startTurn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        prompt: "What is on this screenshot?",
+        input: [
+          { type: "text", text: "What is on this screenshot?" },
+          { type: "localImage", path: imagePath },
+        ],
+      }),
+    );
+  });
+
   it("forwards text file inbound media metadata as text turn input", async () => {
     const { controller, stateDir } = await createControllerHarness();
     const filePath = path.join(stateDir, "tmp", "note.txt");
@@ -5947,6 +6001,512 @@ describe("Discord controller flows", () => {
     ).toHaveLength(1);
   });
 
+  it("rebounds startup recovery onto a fresh thread when the bound thread context is exhausted", async () => {
+    const harness = createApiMock();
+    const store = new PluginStateStore(harness.stateDir);
+    await store.load();
+    await store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: TEST_TELEGRAM_PEER_ID,
+      },
+      sessionKey: buildConversationSessionKey({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: TEST_TELEGRAM_PEER_ID,
+      }),
+      threadId: "thread-exhausted",
+      workspaceDir: "/repo/openclaw",
+      contextUsage: {
+        totalTokens: 127_049,
+        contextWindow: 121_600,
+        remainingTokens: 0,
+        remainingPercent: 0,
+      },
+      taskState: {
+        stage: "executing",
+        goal: "Resume the interrupted cockpit task safely",
+        nextAction: "Continue from the saved checkpoint on a fresh thread if needed",
+        checkpoint: {
+          summary: "Turn interrupted before completion",
+          nextAction: "Restart or steer the task",
+          savedAt: Date.now() - 20_000,
+        },
+        lastHeartbeatAt: Date.now() - 45_000,
+        updatedAt: Date.now() - 45_000,
+      },
+      updatedAt: Date.now() - 45_000,
+    });
+
+    const controller = new CodexPluginController(harness.api);
+    const clientMock = {
+      hasProfile: vi.fn((profile: string) => profile === "default" || profile === "full-access"),
+      logStartupProbe: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+      startThread: vi.fn(async () => ({
+        threadId: "fresh-thread",
+        threadName: "Fresh Recovery Thread",
+        model: "openai/gpt-5.4",
+        cwd: "/repo/openclaw",
+        serviceTier: "default",
+      })),
+      startTurn: vi.fn(() => ({
+        result: new Promise(() => {}),
+        getThreadId: () => "fresh-thread",
+        queueMessage: vi.fn(async () => false),
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      })),
+      readThreadState: vi.fn(async () => ({
+        threadId: "fresh-thread",
+        threadName: "Fresh Recovery Thread",
+        model: "openai/gpt-5.4",
+        cwd: "/repo/openclaw",
+        serviceTier: "default",
+        approvalPolicy: "never",
+        sandbox: "danger-full-access",
+      })),
+      readThreadContext: vi.fn(async () => ({
+        lastUserMessage: undefined,
+        lastAssistantMessage: undefined,
+      })),
+      readAccount: vi.fn(async () => ({
+        email: "test@example.com",
+        planType: "pro",
+        type: "chatgpt",
+      })),
+      readRateLimits: vi.fn(async () => []),
+      listModels: vi.fn(async () => [{ id: "openai/gpt-5.4", current: true }]),
+    };
+    (controller as any).client = clientMock;
+    (controller as any).readThreadHasChanges = vi.fn(async () => false);
+    vi.mocked(fetch).mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      text: async () =>
+        JSON.stringify({
+          success: true,
+          data: [
+            'ID: 7343 | Evgeny "Chip" | Date: 2026-04-12 12:14:16+00:00 | reply to 7342 | Message: Add the latest Telegram context before resuming',
+            'ID: 7342 | Evgeny "Chip" | Date: 2026-04-12 12:13:00+00:00 | Message: Resume from the saved checkpoint and keep the real thread context',
+          ].join("\n"),
+        }),
+    } as Response);
+
+    await controller.start();
+
+    expect(clientMock.startThread).toHaveBeenCalledTimes(1);
+    expect(clientMock.startTurn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        existingThreadId: "fresh-thread",
+        workspaceDir: "/repo/openclaw",
+        prompt: expect.stringContaining("The previous Codex thread hit its context limit before recovery."),
+        input: [
+          expect.objectContaining({
+            type: "text",
+            text: expect.stringContaining("Add the latest Telegram context before resuming"),
+          }),
+          expect.objectContaining({
+            type: "text",
+            text: expect.stringContaining("The previous Codex thread hit its context limit before recovery."),
+          }),
+        ],
+      }),
+    );
+    const reloadedStore = new PluginStateStore(harness.stateDir);
+    await reloadedStore.load();
+    const rebound = reloadedStore.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: TEST_TELEGRAM_PEER_ID,
+    });
+    expect(rebound?.threadId).toBe("fresh-thread");
+    expect(rebound?.contextUsage).toBeUndefined();
+    expect(rebound?.taskState).toEqual(
+      expect.objectContaining({
+        stage: "executing",
+      }),
+    );
+    const sentTexts = harness.sendMessageTelegram.mock.calls.flatMap((call) => {
+      const [, text] = call as unknown as [unknown, unknown];
+      return typeof text === "string" ? [text] : [];
+    });
+    expect(sentTexts).toContain(
+      "Gateway restarted while Codex was working. The previous thread context was full, so continuing on a fresh thread from the saved checkpoint.",
+    );
+  });
+
+  it("auto-compacts idle gpt-5.4 bindings when remaining context drops to 35%", async () => {
+    const harness = createApiMock();
+    const store = new PluginStateStore(harness.stateDir);
+    await store.load();
+    await store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "-1003701370893:topic:3",
+        parentConversationId: "-1003701370893",
+      },
+      sessionKey: "openclaw-codex-app-server:thread:thread-low-context",
+      threadId: "thread-low-context",
+      workspaceDir: "/repo/openclaw",
+      contextUsage: {
+        totalTokens: 170_000,
+        contextWindow: 258_400,
+        remainingPercent: 34,
+      },
+      updatedAt: Date.now() - 10 * 60_000,
+    });
+
+    const controller = new CodexPluginController(harness.api);
+    const clientMock = {
+      hasProfile: vi.fn((profile: string) => profile === "default" || profile === "full-access"),
+      logStartupProbe: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+      readThreadState: vi.fn(async () => ({
+        threadId: "thread-low-context",
+        threadName: "Low Context Thread",
+        model: "openai/gpt-5.4",
+        cwd: "/repo/openclaw",
+        serviceTier: "default",
+        approvalPolicy: "on-request",
+        sandbox: "workspace-write",
+      })),
+      compactThread: vi.fn(async () => ({
+        usage: {
+          totalTokens: 96_000,
+          contextWindow: 258_400,
+          remainingPercent: 63,
+        },
+      })),
+      readThreadContext: vi.fn(async () => ({
+        lastUserMessage: undefined,
+        lastAssistantMessage: undefined,
+      })),
+      readAccount: vi.fn(async () => ({
+        email: "test@example.com",
+        planType: "pro",
+        type: "chatgpt",
+      })),
+      readRateLimits: vi.fn(async () => []),
+    };
+    (controller as any).client = clientMock;
+    (controller as any).readThreadHasChanges = vi.fn(async () => false);
+
+    await controller.start();
+
+    expect(clientMock.compactThread).toHaveBeenCalledWith(
+      expect.objectContaining({
+        threadId: "thread-low-context",
+      }),
+    );
+    const reloadedStore = new PluginStateStore(harness.stateDir);
+    await reloadedStore.load();
+    const rebound = reloadedStore.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "-1003701370893:topic:3",
+      parentConversationId: "-1003701370893",
+    });
+    expect(rebound?.contextUsage).toEqual(
+      expect.objectContaining({
+        totalTokens: 96_000,
+        remainingPercent: 63,
+      }),
+    );
+    expect(rebound?.autoCompactState).toEqual(
+      expect.objectContaining({
+        lastThreadId: "thread-low-context",
+        lastRemainingPercent: 63,
+        lastTotalTokens: 96_000,
+      }),
+    );
+    const sentTexts = harness.sendMessageTelegram.mock.calls.flatMap((call) => {
+      const [, text] = call as unknown as [unknown, unknown];
+      return typeof text === "string" ? [text] : [];
+    });
+    expect(
+      sentTexts.some((text) =>
+        text.includes("Context usage dropped to 34% remaining on openai/gpt-5.4.") &&
+        text.includes("Current context usage: 170k / 258k tokens used (66% full)")
+      ),
+    ).toBe(true);
+    expect(
+      sentTexts.some((text) =>
+        text.includes("Codex compaction completed.") &&
+        text.includes("Starting context usage: 170k / 258k tokens used (66% full)") &&
+        text.includes("Final context usage: 96k / 258k tokens used (37% full)") &&
+        text.includes("Context remaining: 63%.")
+      ),
+    ).toBe(true);
+  });
+
+  it("respects the auto-compaction cooldown for low-context gpt-5.4 bindings", async () => {
+    const harness = createApiMock();
+    const store = new PluginStateStore(harness.stateDir);
+    const now = Date.now();
+    await store.load();
+    await store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "-1003701370893:topic:3",
+        parentConversationId: "-1003701370893",
+      },
+      sessionKey: "openclaw-codex-app-server:thread:thread-low-context",
+      threadId: "thread-low-context",
+      workspaceDir: "/repo/openclaw",
+      contextUsage: {
+        totalTokens: 180_000,
+        contextWindow: 258_400,
+        remainingPercent: 30,
+      },
+      autoCompactState: {
+        lastTriggeredAt: now - 30 * 60_000,
+        lastCompletedAt: now - 29 * 60_000,
+        lastThreadId: "thread-low-context",
+        lastRemainingPercent: 62,
+        lastTotalTokens: 98_000,
+      },
+      updatedAt: now - 30 * 60_000,
+    });
+
+    const controller = new CodexPluginController(harness.api);
+    const clientMock = {
+      hasProfile: vi.fn((profile: string) => profile === "default" || profile === "full-access"),
+      logStartupProbe: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+      readThreadState: vi.fn(async () => ({
+        threadId: "thread-low-context",
+        threadName: "Low Context Thread",
+        model: "openai/gpt-5.4",
+        cwd: "/repo/openclaw",
+        serviceTier: "default",
+        approvalPolicy: "on-request",
+        sandbox: "workspace-write",
+      })),
+      compactThread: vi.fn(async () => ({
+        usage: {
+          totalTokens: 95_000,
+          contextWindow: 258_400,
+          remainingPercent: 63,
+        },
+      })),
+      readThreadContext: vi.fn(async () => ({
+        lastUserMessage: undefined,
+        lastAssistantMessage: undefined,
+      })),
+      readAccount: vi.fn(async () => ({
+        email: "test@example.com",
+        planType: "pro",
+        type: "chatgpt",
+      })),
+      readRateLimits: vi.fn(async () => []),
+    };
+    (controller as any).client = clientMock;
+    (controller as any).readThreadHasChanges = vi.fn(async () => false);
+
+    await controller.start();
+
+    expect(clientMock.compactThread).not.toHaveBeenCalled();
+  });
+
+  it("clears failed auto-compaction attempts so the next reconcile can retry", async () => {
+    const harness = createApiMock();
+    const store = new PluginStateStore(harness.stateDir);
+    await store.load();
+    await store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "-1003701370893:topic:313",
+        parentConversationId: "-1003701370893",
+      },
+      sessionKey: "openclaw-codex-app-server:thread:thread-stuck-low-context",
+      threadId: "thread-stuck-low-context",
+      workspaceDir: "/repo/openclaw",
+      contextUsage: {
+        totalTokens: 221_946,
+        contextWindow: 258_400,
+        remainingPercent: 14,
+      },
+      updatedAt: Date.now() - 10 * 60_000,
+    });
+
+    const controller = new CodexPluginController(harness.api);
+    const clientMock = {
+      hasProfile: vi.fn((profile: string) => profile === "default" || profile === "full-access"),
+      logStartupProbe: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+      readThreadState: vi.fn(async () => ({
+        threadId: "thread-stuck-low-context",
+        threadName: "Stuck Low Context Thread",
+        model: "openai/gpt-5.4",
+        cwd: "/repo/openclaw",
+        serviceTier: "default",
+        approvalPolicy: "on-request",
+        sandbox: "workspace-write",
+      })),
+      compactThread: vi.fn(async () => {
+        throw new Error("transport warming up");
+      }),
+      readThreadContext: vi.fn(async () => ({
+        lastUserMessage: undefined,
+        lastAssistantMessage: undefined,
+      })),
+      readAccount: vi.fn(async () => ({
+        email: "test@example.com",
+        planType: "pro",
+        type: "chatgpt",
+      })),
+      readRateLimits: vi.fn(async () => []),
+    };
+    (controller as any).client = clientMock;
+    (controller as any).readThreadHasChanges = vi.fn(async () => false);
+
+    await controller.start();
+
+    const reloadedStore = new PluginStateStore(harness.stateDir);
+    await reloadedStore.load();
+    const rebound = reloadedStore.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "-1003701370893:topic:313",
+      parentConversationId: "-1003701370893",
+    });
+    expect(rebound?.autoCompactState).toEqual(
+      expect.objectContaining({
+        lastThreadId: "thread-stuck-low-context",
+        lastRemainingPercent: 14,
+        lastTotalTokens: 221_946,
+      }),
+    );
+    expect(rebound?.autoCompactState?.lastFailedAt).toEqual(expect.any(Number));
+    expect(rebound?.autoCompactState?.lastCompletedAt).toBeUndefined();
+  });
+
+  it("rebinds auto-compaction targets onto a fresh thread when the rollout is missing", async () => {
+    const harness = createApiMock();
+    const store = new PluginStateStore(harness.stateDir);
+    await store.load();
+    await store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "-1003701370893:topic:313",
+        parentConversationId: "-1003701370893",
+      },
+      sessionKey: "openclaw-codex-app-server:thread:thread-stuck-low-context",
+      threadId: "thread-stuck-low-context",
+      workspaceDir: "/repo/openclaw",
+      contextUsage: {
+        totalTokens: 221_946,
+        contextWindow: 258_400,
+        remainingPercent: 14,
+      },
+      updatedAt: Date.now() - 10 * 60_000,
+    });
+
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-binding-summary-"));
+    vi.stubEnv("HOME", fakeHome);
+    const telegramStateDir = path.join(fakeHome, ".openclaw", "telegram");
+    fs.mkdirSync(telegramStateDir, { recursive: true });
+    const bindingPath = path.join(telegramStateDir, "thread-bindings-default.json");
+    fs.writeFileSync(bindingPath, JSON.stringify({
+      version: 1,
+      bindings: [
+        {
+          accountId: "default",
+          conversationId: "-1003701370893:topic:313",
+          targetKind: "acp",
+          targetSessionKey: "plugin-binding:test",
+          metadata: {
+            pluginBindingOwner: "plugin",
+            pluginId: "test-plugin",
+            summary: "Bind this conversation to Codex thread stale-thread.",
+          },
+        },
+      ],
+    }, null, 2));
+
+    const controller = new CodexPluginController(harness.api);
+    const clientMock = {
+      hasProfile: vi.fn((profile: string) => profile === "default" || profile === "full-access"),
+      logStartupProbe: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+      startThread: vi.fn(async () => ({
+        threadId: "fresh-thread",
+        threadName: "Fresh Thread",
+        model: "openai/gpt-5.4",
+        cwd: "/repo/openclaw",
+        serviceTier: "default",
+      })),
+      readThreadState: vi.fn(async () => ({
+        threadId: "thread-stuck-low-context",
+        threadName: "Stuck Low Context Thread",
+        model: "openai/gpt-5.4",
+        cwd: "/repo/openclaw",
+        serviceTier: "default",
+        approvalPolicy: "on-request",
+        sandbox: "workspace-write",
+      })),
+      compactThread: vi.fn(async () => {
+        throw new Error("codex app server rpc error (-32600): no rollout found for thread id thread-stuck-low-context");
+      }),
+      readThreadContext: vi.fn(async () => ({
+        lastUserMessage: undefined,
+        lastAssistantMessage: undefined,
+      })),
+      readAccount: vi.fn(async () => ({
+        email: "test@example.com",
+        planType: "pro",
+        type: "chatgpt",
+      })),
+      readRateLimits: vi.fn(async () => []),
+    };
+    (controller as any).client = clientMock;
+    (controller as any).readThreadHasChanges = vi.fn(async () => false);
+
+    await controller.start();
+
+    expect(clientMock.compactThread).toHaveBeenCalledWith(
+      expect.objectContaining({
+        threadId: "thread-stuck-low-context",
+      }),
+    );
+    expect(clientMock.startThread).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionKey: "openclaw-codex-app-server:thread:thread-stuck-low-context",
+        workspaceDir: "/repo/openclaw",
+      }),
+    );
+
+    const reloadedStore = new PluginStateStore(harness.stateDir);
+    await reloadedStore.load();
+    const rebound = reloadedStore.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "-1003701370893:topic:313",
+      parentConversationId: "-1003701370893",
+    });
+    expect(rebound?.threadId).toBe("fresh-thread");
+    expect(rebound?.contextUsage).toBeUndefined();
+    expect(rebound?.autoCompactState).toBeUndefined();
+
+    const bindingState = JSON.parse(fs.readFileSync(bindingPath, "utf8"));
+    expect(bindingState.bindings[0]?.metadata?.summary).toContain("Fresh Thread");
+
+    const sentTexts = harness.sendMessageTelegram.mock.calls.flatMap((call) => {
+      const [, text] = call as unknown as [unknown, unknown];
+      return typeof text === "string" ? [text] : [];
+    });
+    expect(sentTexts.some((text) => text.includes("fresh Codex thread"))).toBe(true);
+    expect(sentTexts.some((text) => text.includes("Codex failed:"))).toBe(false);
+  });
+
   it("auto-recovers stale verifying bindings onto a fresh thread", async () => {
     const harness = createApiMock();
     const store = new PluginStateStore(harness.stateDir);
@@ -6096,6 +6656,12 @@ describe("Discord controller flows", () => {
       parentConversationId: "-1003701370893",
     });
     expect(rebound?.threadId).toBe("fresh-thread");
+    expect(rebound?.taskState).toEqual(
+      expect.objectContaining({
+        stage: "executing",
+        goal: "?",
+      }),
+    );
     const sentTexts = harness.sendMessageTelegram.mock.calls.flatMap((call) => {
       const [, text] = call as unknown as [unknown, unknown];
       return typeof text === "string" ? [text] : [];
@@ -7580,6 +8146,11 @@ describe("Discord controller flows", () => {
       sessionKey: "session-1",
       threadId: "thread-1",
       workspaceDir: "/repo/openclaw",
+      contextUsage: {
+        totalTokens: 221_946,
+        contextWindow: 258_400,
+        remainingPercent: 14,
+      },
       updatedAt: Date.now(),
     });
     const callback = await (controller as any).store.putCallback({
@@ -7619,6 +8190,53 @@ describe("Discord controller flows", () => {
     expect(editMessage).toHaveBeenLastCalledWith(
       expect.objectContaining({
         text: expect.stringContaining("Compaction started."),
+        buttons: expect.any(Array),
+      }),
+    );
+  });
+
+  it("refuses compaction from the status card when the rebound thread has no materialized context", async () => {
+    const { controller } = await createControllerHarness();
+    const startCompact = vi.fn(async () => {});
+    (controller as any).startCompact = startCompact;
+    await (controller as any).store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+      sessionKey: "session-1",
+      threadId: "thread-1",
+      workspaceDir: "/repo/openclaw",
+      contextUsage: null,
+      updatedAt: Date.now(),
+    });
+    const callback = await (controller as any).store.putCallback({
+      kind: "compact-thread",
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "123",
+      },
+    });
+    const editMessage = vi.fn(async (_payload: any) => {});
+
+    await controller.handleTelegramInteractive({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123",
+      callback: { payload: callback.token },
+      respond: {
+        clearButtons: vi.fn(async () => {}),
+        reply: vi.fn(async () => {}),
+        editMessage,
+      },
+    } as any);
+
+    expect(startCompact).not.toHaveBeenCalled();
+    expect(editMessage).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        text: expect.stringContaining("has no materialized context yet"),
         buttons: expect.any(Array),
       }),
     );
