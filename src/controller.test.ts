@@ -613,7 +613,7 @@ describe("Discord controller flows", () => {
   });
 
   it("starts a new thread directly for /cas_resume --new without args in the default workspace", async () => {
-    const { controller, clientMock } = await createControllerHarness();
+    const { controller, clientMock, sendMessageTelegram } = await createControllerHarness();
     const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));
 
     const reply = await controller.handleCommand(
@@ -625,7 +625,10 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
+    expect(reply.text).toContain("Binding: Discord Thread (openclaw)");
+    expect(reply.text).toContain("Project folder: /repo/openclaw");
+    expect((reply.channelData as any)?.telegram?.buttons).toHaveLength(5);
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
     expect(clientMock.startThread).toHaveBeenCalledWith({
       profile: "default",
       sessionKey: undefined,
@@ -640,7 +643,7 @@ describe("Discord controller flows", () => {
   });
 
   it("starts a new full-access thread directly for /cas_resume --new --yolo", async () => {
-    const { controller, clientMock } = await createControllerHarness();
+    const { controller, clientMock, sendMessageTelegram } = await createControllerHarness();
     const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));
 
     const reply = await controller.handleCommand(
@@ -652,7 +655,10 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
+    expect(reply.text).toContain("Binding: Discord Thread (openclaw)");
+    expect(reply.text).toContain("Permissions: Full Access");
+    expect((reply.channelData as any)?.telegram?.buttons).toHaveLength(5);
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
     expect(clientMock.startThread).toHaveBeenCalledWith({
       profile: "full-access",
       sessionKey: undefined,
@@ -769,7 +775,7 @@ describe("Discord controller flows", () => {
   });
 
   it("starts a new thread directly for /cas_resume --new <project>", async () => {
-    const { controller, clientMock } = await createControllerHarness();
+    const { controller, clientMock, sendMessageTelegram } = await createControllerHarness();
     const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));
 
     const reply = await controller.handleCommand(
@@ -781,7 +787,10 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
+    expect(reply.text).toContain("Binding: Discord Thread (openclaw)");
+    expect(reply.text).toContain("Project folder: /repo/openclaw");
+    expect((reply.channelData as any)?.telegram?.buttons).toHaveLength(5);
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
     expect(clientMock.startThread).toHaveBeenCalledWith({
       profile: "default",
       sessionKey: undefined,
@@ -872,7 +881,7 @@ describe("Discord controller flows", () => {
   });
 
   it("expands home-relative paths for /cas_resume --new positional workspace args", async () => {
-    const { controller, clientMock } = await createControllerHarness();
+    const { controller, clientMock, sendMessageTelegram } = await createControllerHarness();
     const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));
 
     const reply = await controller.handleCommand(
@@ -884,7 +893,9 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
+    expect(reply.text).toContain("Binding: Discord Thread (openclaw)");
+    expect((reply.channelData as any)?.telegram?.buttons).toHaveLength(5);
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
     expect(clientMock.startThread).toHaveBeenCalledWith({
       profile: "default",
       sessionKey: undefined,
@@ -1958,12 +1969,10 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
-    expect(sendMessageTelegram).toHaveBeenCalledTimes(1);
-    const firstCall = sendMessageTelegram.mock.calls[0] as unknown as
-      | [string, string, { buttons?: Array<Array<{ text: string; callback_data: string }>> }]
-      | undefined;
-    const buttons = firstCall?.[2]?.buttons ?? [];
+    expect(reply.text).toContain("Binding: Discord Thread (openclaw)");
+    expect(reply.text).toContain("Project folder: /repo/openclaw");
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    const buttons = (reply.channelData as any)?.telegram?.buttons ?? [];
 
     expect(buttons).toHaveLength(5);
     expect(buttons[0][0].text).toBe("Select Model");
@@ -2033,13 +2042,12 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
-    const firstCall = sendMessageTelegram.mock.calls[0] as unknown as
-      | [string, string, { buttons?: Array<Array<{ text: string; callback_data: string }>> }]
-      | undefined;
-    const buttonLabels = firstCall?.[2]?.buttons?.flat().map((button) => button.text) ?? [];
+    expect(reply.text).toContain("Blocker: Codex paused for approval");
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    const buttons = (reply.channelData as any)?.telegram?.buttons ?? [];
+    const buttonLabels = buttons.flat().map((button: { text: string }) => button.text);
     expect(buttonLabels).toEqual(expect.arrayContaining(["Resume", "Mark verified", "Clear blocker"]));
-    const kinds = (firstCall?.[2]?.buttons ?? []).flatMap((row: Array<{ callback_data: string }>) =>
+    const kinds = buttons.flatMap((row: Array<{ callback_data: string }>) =>
       row.map((button) => {
         const token = button.callback_data.split(":").pop() ?? "";
         return (controller as any).store.getCallback(token)?.kind;
@@ -2070,16 +2078,9 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
-    expect(sendMessageTelegram).toHaveBeenCalledTimes(1);
-    expect(sendMessageTelegram).toHaveBeenCalledWith(
-      "123",
-      expect.stringContaining("Binding: Discord Thread"),
-      expect.objectContaining({
-        accountId: "default",
-        buttons: expect.any(Array),
-      }),
-    );
+    expect(reply.text).toContain("Binding: Discord Thread (openclaw)");
+    expect((reply.channelData as any)?.telegram?.buttons).toHaveLength(5);
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
   });
 
   it("preserves Telegram buttons when the outbound adapter lacks sendPayload", async () => {
@@ -2105,16 +2106,9 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
-    expect(sendMessageTelegram).toHaveBeenCalledTimes(1);
-    expect(sendMessageTelegram).toHaveBeenCalledWith(
-      "123",
-      expect.stringContaining("Binding: Discord Thread"),
-      expect.objectContaining({
-        accountId: "default",
-        buttons: expect.any(Array),
-      }),
-    );
+    expect(reply.text).toContain("Binding: Discord Thread (openclaw)");
+    expect((reply.channelData as any)?.telegram?.buttons).toHaveLength(5);
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
   });
 
   it("shows pending default controls when the bound thread is not materialized yet", async () => {
@@ -2144,13 +2138,9 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
-    expect(sendMessageTelegram).toHaveBeenCalledTimes(1);
-    const firstCall = sendMessageTelegram.mock.calls[0] as unknown as
-      | [string, string, { buttons?: Array<Array<{ text: string; callback_data: string }>> }]
-      | undefined;
-    const text = firstCall?.[1] ?? "";
-    const buttons = firstCall?.[2]?.buttons ?? [];
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    const text = reply.text ?? "";
+    const buttons = (reply.channelData as any)?.telegram?.buttons ?? [];
 
     expect(text).toContain("Model: unknown");
     expect(text).toContain("saved as defaults until then");
@@ -2187,11 +2177,8 @@ describe("Discord controller flows", () => {
         getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
       }),
     );
-    expect(reply).toEqual({});
-    const firstCall = sendMessageTelegram.mock.calls[0] as unknown as
-      | [string, string, { buttons?: Array<Array<{ text: string; callback_data: string }>> }]
-      | undefined;
-    const buttons = firstCall?.[2]?.buttons ?? [];
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    const buttons = (reply.channelData as any)?.telegram?.buttons ?? [];
 
     expect(buttons[1]).toHaveLength(1);
     expect(buttons[1][0].text).toBe("Permissions: toggle");
@@ -2234,9 +2221,8 @@ describe("Discord controller flows", () => {
         getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
       }),
     );
-    expect(reply).toEqual({});
-    const firstCall = sendMessageTelegram.mock.calls[0] as unknown as [string, string] | undefined;
-    const text = firstCall?.[1] ?? "";
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    const text = reply.text ?? "";
     expect(text).toContain("Binding: Discord Thread (openclaw)");
     expect(text).toContain("Model: openai/gpt-5.3-codex · reasoning high");
     expect(text).toContain("Fast mode: off");
@@ -2324,9 +2310,8 @@ describe("Discord controller flows", () => {
       threadId: "thread-1",
       serviceTier: "fast",
     });
-    expect(reply).toEqual({});
-    const firstCall = sendMessageTelegram.mock.calls[0] as unknown as [string, string] | undefined;
-    const text = firstCall?.[1] ?? "";
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    const text = reply.text ?? "";
     expect(text).toContain("Model: gpt-5.4");
     expect(text).toContain("Fast mode: on");
     expect(text).toContain("Permissions: Full Access");
@@ -2375,9 +2360,8 @@ describe("Discord controller flows", () => {
       threadId: "thread-1",
       serviceTier: "fast",
     });
-    expect(reply).toEqual({});
-    const firstCall = sendMessageTelegram.mock.calls[0] as unknown as [string, string] | undefined;
-    const text = firstCall?.[1] ?? "";
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    const text = reply.text ?? "";
     expect(text).toContain("Model: gpt-5.4");
     expect(text).toContain("Fast mode: on");
     expect(text).toContain("Permissions: Full Access");
@@ -3438,7 +3422,7 @@ describe("Discord controller flows", () => {
   });
 
   it("routes /cas_new through the new-thread full-access path", async () => {
-    const { controller, clientMock } = await createControllerHarness();
+    const { controller, clientMock, sendMessageTelegram } = await createControllerHarness();
     const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));
 
     const reply = await controller.handleCommand(
@@ -3449,7 +3433,10 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
+    expect(reply.text).toContain("Binding: Discord Thread (openclaw)");
+    expect(reply.text).toContain("Project folder: /repo/openclaw");
+    expect((reply.channelData as any)?.telegram?.buttons).toHaveLength(5);
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
     expect(clientMock.startThread).toHaveBeenCalledWith({
       profile: "full-access",
       sessionKey: undefined,
@@ -3491,7 +3478,8 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
+    expect(reply.text).toContain("Binding: Discord Thread (openclaw)");
+    expect((reply.channelData as any)?.telegram?.buttons).toHaveLength(5);
     const binding = (controller as any).store.getBinding({
       channel: "telegram",
       accountId: "default",
@@ -8712,21 +8700,14 @@ describe("Discord controller flows", () => {
       getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
     }));
 
-    expect(statusReply).toEqual({});
-    expect(sendMessageTelegram).toHaveBeenLastCalledWith(
-      "123",
-      expect.stringContaining("Task card:"),
-      expect.objectContaining({
-        accountId: "default",
-        buttons: expect.any(Array),
-      }),
-    );
-    const lastStatusText = sendMessageTelegram.mock.calls.at(-1)?.[1] as string;
-    expect(lastStatusText).toContain("Goal: Ship the prod-safe cockpit task card");
-    expect(lastStatusText).toContain("Stage: executing");
-    expect(lastStatusText).toContain("Next action: Run the prod smoke checks");
-    expect(lastStatusText).toContain("Latest evidence: Local vitest is green");
-    expect(lastStatusText).toContain("Blocker: Waiting for the Telegram reply path");
+    expect(statusReply.text).toContain("Task card:");
+    expect((statusReply.channelData as any)?.telegram?.buttons).toEqual(expect.any(Array));
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    expect(statusReply.text).toContain("Goal: Ship the prod-safe cockpit task card");
+    expect(statusReply.text).toContain("Stage: executing");
+    expect(statusReply.text).toContain("Next action: Run the prod smoke checks");
+    expect(statusReply.text).toContain("Latest evidence: Local vitest is green");
+    expect(statusReply.text).toContain("Blocker: Waiting for the Telegram reply path");
   });
 
   it("stores verification and checkpoint state through cas_verify and cas_checkpoint", async () => {
@@ -8764,12 +8745,12 @@ describe("Discord controller flows", () => {
       getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
     }));
 
-    expect(statusReply).toEqual({});
-    const lastStatusText = sendMessageTelegram.mock.calls.at(-1)?.[1] as string;
-    expect(lastStatusText).toContain("Verification: Verified");
-    expect(lastStatusText).toContain("Verification summary: Local tests and host-side typecheck passed");
-    expect(lastStatusText).toContain("Checkpoint: Runtime artifact is ready");
-    expect(lastStatusText).toContain("Checkpoint next: Copy to ~/.openclaw/extensions and run /cas_status");
+    expect(statusReply.text).toContain("Verification: Verified");
+    expect((statusReply.channelData as any)?.telegram?.buttons).toEqual(expect.any(Array));
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    expect(statusReply.text).toContain("Verification summary: Local tests and host-side typecheck passed");
+    expect(statusReply.text).toContain("Checkpoint: Runtime artifact is ready");
+    expect(statusReply.text).toContain("Checkpoint next: Copy to ~/.openclaw/extensions and run /cas_status");
   });
 
   it("refreshes a pinned Telegram status card in place after task-state updates", async () => {

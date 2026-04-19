@@ -3201,12 +3201,23 @@ export class CodexPluginController {
         requestedYolo: parsed.requestedYolo,
       },
       requestConversationBinding,
+      !isTelegramChannel(channel),
     );
     if (result.status === "pending") {
       return result.reply;
     }
     if (result.status === "error") {
       return { text: result.message };
+    }
+    if (isTelegramChannel(channel)) {
+      const nextBinding = this.store.getBinding(conversation);
+      if (nextBinding) {
+        const card = await this.buildStatusCard(conversation, nextBinding, true);
+        if (card.buttons) {
+          return buildReplyWithButtons(card.text, card.buttons);
+        }
+        return { text: card.text };
+      }
     }
     return {};
   }
@@ -7057,6 +7068,7 @@ Latest context usage: ${usageText}`
           requestedYolo: callback.requestedYolo,
         },
         responders.requestConversationBinding,
+        true,
         callback.preserveTaskState ?? true,
       );
       if (result.status === "pending") {
@@ -8047,6 +8059,7 @@ Compaction started.`,
     syncTopic: boolean,
     overrides: CommandPreferenceOverrides,
     requestConversationBinding?: PickerResponders["requestConversationBinding"],
+    sendNotifications = true,
     preserveTaskState = false,
   ): Promise<
     | { status: "bound" }
@@ -8098,7 +8111,9 @@ Compaction started.`,
         await this.renameConversationIfSupported(conversation, syncedName);
       }
     }
-    await this.sendBoundConversationNotifications(conversation);
+    if (sendNotifications) {
+      await this.sendBoundConversationNotifications(conversation);
+    }
     return { status: "bound" };
   }
 
@@ -8832,14 +8847,15 @@ Compaction started.`,
     text: string,
     buttons: PluginInteractiveButtons,
   ): Promise<ReplyPayload> {
+    if (isTelegramChannel(conversation.channel)) {
+      return buildReplyWithButtons(text, buttons);
+    }
     try {
       await this.sendReplyWithDeliveryRef(conversation, {
         text,
         buttons,
       });
-      return isDiscordChannel(conversation.channel)
-        ? { text: "Sent Codex status controls to this Discord conversation." }
-        : {};
+      return { text: "Sent Codex status controls to this Discord conversation." };
     } catch (error) {
       this.api.logger.warn(`codex ${conversation.channel} status card send failed: ${String(error)}`);
       return { text };
