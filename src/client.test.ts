@@ -56,6 +56,49 @@ describe("buildTurnStartPayloads", () => {
     ]);
   });
 
+  it("carries approval policy and sandbox policy overrides on turn/start", async () => {
+    await expect(
+      __testing.buildTurnStartPayloads({
+        threadId: "thread-123",
+        prompt: "ship it",
+        approvalPolicy: "on-request",
+        sandbox: "workspace-write",
+        cwd: "/repo/openclaw",
+      }),
+    ).resolves.toEqual([
+      {
+        threadId: "thread-123",
+        input: [{ type: "text", text: "ship it" }],
+        approvalPolicy: "on-request",
+        sandboxPolicy: {
+          type: "workspaceWrite",
+          writableRoots: ["/repo/openclaw"],
+          readOnlyAccess: { type: "fullAccess" },
+          networkAccess: true,
+          excludeTmpdirEnvVar: false,
+          excludeSlashTmp: false,
+        },
+      },
+    ]);
+  });
+
+  it("omits workspace-write sandbox override when cwd is unavailable", async () => {
+    await expect(
+      __testing.buildTurnStartPayloads({
+        threadId: "thread-123",
+        prompt: "ship it",
+        approvalPolicy: "on-request",
+        sandbox: "workspace-write",
+      }),
+    ).resolves.toEqual([
+      {
+        threadId: "thread-123",
+        input: [{ type: "text", text: "ship it" }],
+        approvalPolicy: "on-request",
+      },
+    ]);
+  });
+
   it("materializes mixed text and local image input into a turn-compatible image payload", async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-client-test-"));
     const imagePath = path.join(tempDir, "screenshot.png");
@@ -1038,6 +1081,104 @@ describe("extractAssistantNotificationText", () => {
         },
       }),
     ).toEqual({ mode: "snapshot", text: "Final answer.", itemId: undefined });
+  });
+
+  it("extracts assistant replay text when thread/read uses underscored roles", () => {
+    expect(
+      __testing.extractThreadReplayFromReadResult({
+        thread: {
+          turns: [
+            { role: "user_message", text: "review this diff" },
+            { role: "assistant_message", text: "Here is the review." },
+          ],
+        },
+      }),
+    ).toEqual({
+      lastUserMessage: "review this diff",
+      lastAssistantMessage: "Here is the review.",
+    });
+  });
+});
+
+describe("startTurn recovery", () => {
+  it("recovers the final assistant reply from thread/read when completion notifications are silent", async () => {
+    const request = vi.fn(async (method: string, params: Record<string, unknown>) => {
+      if (method === "thread/start") {
+        return {
+          threadId: "thread-123",
+          model: "gpt-5.4",
+        };
+      }
+      if (method === "turn/start") {
+        return {
+          threadId: "thread-123",
+          runId: "turn-123",
+        };
+      }
+      if (method === "thread/read") {
+        expect(params).toEqual({ threadId: "thread-123", includeTurns: true });
+        return {
+          thread: {
+            turns: [
+              { role: "user_message", text: "Ship it" },
+              { role: "assistant_message", text: "Recovered final answer." },
+            ],
+          },
+        };
+      }
+      return {};
+    });
+    const client = new CodexAppServerClient(
+      {
+        enabled: true,
+        transport: "stdio",
+        command: "codex",
+        args: [],
+        requestTimeoutMs: 1_000,
+      },
+      {
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      },
+    );
+    (client as any).ensureConnected = vi.fn(async () => ({
+      client: {
+        connect: vi.fn(),
+        close: vi.fn(),
+        notify: vi.fn(),
+        request,
+        setNotificationHandler: vi.fn(),
+        setRequestHandler: vi.fn(),
+      },
+      initializeResult: {},
+    }));
+
+    const run = client.startTurn({
+      sessionKey: "session-abc",
+      workspaceDir: "/repo/openclaw",
+      prompt: "Ship it",
+      runId: "run-1",
+    });
+
+    await (client as any).dispatchNotification("turn/completed", {
+      threadId: "thread-123",
+      runId: "turn-123",
+      turn: { status: "completed" },
+    });
+
+    await expect(run.result).resolves.toEqual(
+      expect.objectContaining({
+        threadId: "thread-123",
+        text: "Recovered final answer.",
+      }),
+    );
+    expect(request).toHaveBeenCalledWith(
+      "thread/read",
+      { threadId: "thread-123", includeTurns: true },
+      1_000,
+    );
   });
 });
 

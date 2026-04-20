@@ -100,11 +100,12 @@ describe("command help metadata", () => {
     expect(text).toContain("With no flags, this shows the current status card");
   });
 
-  it("documents the cas_new alias", () => {
+  it("documents the cas_new quick alias", () => {
     const text = renderCommandHelpText("cas_new");
     expect(text).toContain("/cas_new");
     expect(text).toContain("/cas_resume --new --yolo");
     expect(text).toContain("Full Access");
+    expect(text).toContain("Fast alias");
   });
 
   it("documents cockpit task, verification, and checkpoint commands", () => {

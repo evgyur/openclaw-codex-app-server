@@ -1046,6 +1046,47 @@ function buildThreadResumePayloads(params: {
   return [base];
 }
 
+function buildSandboxPolicyOverride(
+  sandbox: string | undefined,
+  cwd?: string,
+): Record<string, unknown> | undefined {
+  const normalized = normalizeSandboxMode(sandbox);
+  if (!normalized) {
+    return undefined;
+  }
+  if (normalized === "danger-full-access") {
+    return { type: "dangerFullAccess" };
+  }
+  if (normalized === "workspace-write") {
+    const workspaceRoot = cwd?.trim();
+    if (!workspaceRoot) {
+      return undefined;
+    }
+    return {
+      type: "workspaceWrite",
+      writableRoots: [workspaceRoot],
+      readOnlyAccess: { type: "fullAccess" },
+      networkAccess: true,
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false,
+    };
+  }
+  if (normalized === "read-only") {
+    return {
+      type: "readOnly",
+      access: { type: "fullAccess" },
+      networkAccess: true,
+    };
+  }
+  if (normalized === "external-sandbox") {
+    return {
+      type: "externalSandbox",
+      networkAccess: "enabled",
+    };
+  }
+  return undefined;
+}
+
 function normalizeSandboxMode(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   if (!trimmed) {
@@ -1162,6 +1203,9 @@ async function buildTurnStartPayloads(params: {
   input?: readonly CodexTurnInputItem[];
   model?: string;
   serviceTier?: string;
+  approvalPolicy?: string;
+  sandbox?: string;
+  cwd?: string;
   collaborationMode?: CollaborationMode;
   collaborationFallbackModel?: string;
 }): Promise<unknown[]> {
@@ -1169,6 +1213,13 @@ async function buildTurnStartPayloads(params: {
     threadId: params.threadId,
     input: await buildTurnInput(params.prompt, params.input),
   };
+  if (params.approvalPolicy?.trim()) {
+    base.approvalPolicy = params.approvalPolicy.trim();
+  }
+  const sandboxPolicy = buildSandboxPolicyOverride(params.sandbox, params.cwd);
+  if (sandboxPolicy) {
+    base.sandboxPolicy = sandboxPolicy;
+  }
   if (params.model?.trim()) {
     base.model = params.model.trim();
   }
@@ -1321,11 +1372,25 @@ function extractThreadsFromValue(value: unknown): ThreadSummary[] {
 }
 
 function normalizeConversationRole(value: string | undefined): "user" | "assistant" | undefined {
-  const normalized = value?.trim().toLowerCase();
-  if (normalized === "user" || normalized === "usermessage") {
+  const normalized = value
+    ?.trim()
+    .toLowerCase()
+    .replace(/[^a-z]/g, "");
+  if (
+    normalized === "user" ||
+    normalized === "usermessage" ||
+    normalized === "chatkitusermessage"
+  ) {
     return "user";
   }
-  if (normalized === "assistant" || normalized === "agentmessage" || normalized === "assistantmessage") {
+  if (
+    normalized === "assistant" ||
+    normalized === "agent" ||
+    normalized === "bot" ||
+    normalized === "agentmessage" ||
+    normalized === "assistantmessage" ||
+    normalized === "chatkitassistantmessage"
+  ) {
     return "assistant";
   }
   return undefined;
@@ -3710,6 +3775,9 @@ export class CodexAppServerClient {
           input: params.input,
           model: params.model,
           serviceTier: params.serviceTier,
+          approvalPolicy: params.approvalPolicy,
+          sandbox: params.sandbox,
+          cwd: params.workspaceDir,
           collaborationMode,
           collaborationFallbackModel: params.model?.trim() || threadModel,
         });
@@ -3745,6 +3813,40 @@ export class CodexAppServerClient {
         this.logger.debug(
           `codex turn completion settled run=${params.runId} thread=${threadId || "<none>"} turn=${turnId || "<none>"} interrupted=${interrupted ? "yes" : "no"} assistantChars=${assistantText.length}`,
         );
+        let recoveredAssistantText = "";
+        if (
+          !assistantText.trim() &&
+          !interrupted &&
+          !approvalCancelled &&
+          !finalPlanMarkdown &&
+          planDraftByItemId.size === 0 &&
+          planSteps.length === 0 &&
+          threadId &&
+          terminalStatus !== "failed" &&
+          terminalStatus !== "interrupted"
+        ) {
+          try {
+            const replay = extractThreadReplayFromReadResult(
+              await requestWithFallbacks({
+                client,
+                methods: ["thread/read"],
+                payloads: [{ threadId, includeTurns: true }],
+                timeoutMs: this.settings.requestTimeoutMs,
+              }),
+            );
+            recoveredAssistantText = replay.lastAssistantMessage?.trim() ?? "";
+            if (recoveredAssistantText) {
+              assistantText = recoveredAssistantText;
+              this.logger.debug(
+                `codex turn recovered assistant text from thread/read run=${params.runId} thread=${threadId} chars=${recoveredAssistantText.length} preview="${summarizeTextForLog(recoveredAssistantText, 80)}"`,
+              );
+            }
+          } catch (error) {
+            this.logger.debug(
+              `codex turn thread/read recovery failed run=${params.runId} thread=${threadId}: ${String(error)}`,
+            );
+          }
+        }
         const stoppedReason = resolveTurnStoppedReason({
           interrupted,
           terminalStatus,
@@ -4053,6 +4155,8 @@ export const __testing = {
   formatFileEditNotice,
   extractThreadTokenUsageSnapshot,
   extractRateLimitSummaries,
+  extractThreadReplayFromReadResult,
+  buildSandboxPolicyOverride,
   formatStdioProcessLog,
   resolveTurnStoppedReason,
 };

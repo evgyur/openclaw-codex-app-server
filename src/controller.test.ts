@@ -613,7 +613,7 @@ describe("Discord controller flows", () => {
   });
 
   it("starts a new thread directly for /cas_resume --new without args in the default workspace", async () => {
-    const { controller, clientMock } = await createControllerHarness();
+    const { controller, clientMock, sendMessageTelegram } = await createControllerHarness();
     const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));
 
     const reply = await controller.handleCommand(
@@ -625,7 +625,10 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
+    expect(reply.text).toContain("Binding: Discord Thread (openclaw)");
+    expect(reply.text).toContain("Project folder: /repo/openclaw");
+    expect((reply.channelData as any)?.telegram?.buttons).toHaveLength(5);
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
     expect(clientMock.startThread).toHaveBeenCalledWith({
       profile: "default",
       sessionKey: undefined,
@@ -640,7 +643,7 @@ describe("Discord controller flows", () => {
   });
 
   it("starts a new full-access thread directly for /cas_resume --new --yolo", async () => {
-    const { controller, clientMock } = await createControllerHarness();
+    const { controller, clientMock, sendMessageTelegram } = await createControllerHarness();
     const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));
 
     const reply = await controller.handleCommand(
@@ -652,7 +655,10 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
+    expect(reply.text).toContain("Binding: Discord Thread (openclaw)");
+    expect(reply.text).toContain("Permissions: Full Access");
+    expect((reply.channelData as any)?.telegram?.buttons).toHaveLength(5);
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
     expect(clientMock.startThread).toHaveBeenCalledWith({
       profile: "full-access",
       sessionKey: undefined,
@@ -769,7 +775,7 @@ describe("Discord controller flows", () => {
   });
 
   it("starts a new thread directly for /cas_resume --new <project>", async () => {
-    const { controller, clientMock } = await createControllerHarness();
+    const { controller, clientMock, sendMessageTelegram } = await createControllerHarness();
     const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));
 
     const reply = await controller.handleCommand(
@@ -781,7 +787,10 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
+    expect(reply.text).toContain("Binding: Discord Thread (openclaw)");
+    expect(reply.text).toContain("Project folder: /repo/openclaw");
+    expect((reply.channelData as any)?.telegram?.buttons).toHaveLength(5);
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
     expect(clientMock.startThread).toHaveBeenCalledWith({
       profile: "default",
       sessionKey: undefined,
@@ -872,7 +881,7 @@ describe("Discord controller flows", () => {
   });
 
   it("expands home-relative paths for /cas_resume --new positional workspace args", async () => {
-    const { controller, clientMock } = await createControllerHarness();
+    const { controller, clientMock, sendMessageTelegram } = await createControllerHarness();
     const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));
 
     const reply = await controller.handleCommand(
@@ -884,7 +893,9 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
+    expect(reply.text).toContain("Binding: Discord Thread (openclaw)");
+    expect((reply.channelData as any)?.telegram?.buttons).toHaveLength(5);
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
     expect(clientMock.startThread).toHaveBeenCalledWith({
       profile: "default",
       sessionKey: undefined,
@@ -1958,12 +1969,10 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
-    expect(sendMessageTelegram).toHaveBeenCalledTimes(1);
-    const firstCall = sendMessageTelegram.mock.calls[0] as unknown as
-      | [string, string, { buttons?: Array<Array<{ text: string; callback_data: string }>> }]
-      | undefined;
-    const buttons = firstCall?.[2]?.buttons ?? [];
+    expect(reply.text).toContain("Binding: Discord Thread (openclaw)");
+    expect(reply.text).toContain("Project folder: /repo/openclaw");
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    const buttons = (reply.channelData as any)?.telegram?.buttons ?? [];
 
     expect(buttons).toHaveLength(5);
     expect(buttons[0][0].text).toBe("Select Model");
@@ -2033,13 +2042,12 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
-    const firstCall = sendMessageTelegram.mock.calls[0] as unknown as
-      | [string, string, { buttons?: Array<Array<{ text: string; callback_data: string }>> }]
-      | undefined;
-    const buttonLabels = firstCall?.[2]?.buttons?.flat().map((button) => button.text) ?? [];
+    expect(reply.text).toContain("Blocker: Codex paused for approval");
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    const buttons = (reply.channelData as any)?.telegram?.buttons ?? [];
+    const buttonLabels = buttons.flat().map((button: { text: string }) => button.text);
     expect(buttonLabels).toEqual(expect.arrayContaining(["Resume", "Mark verified", "Clear blocker"]));
-    const kinds = (firstCall?.[2]?.buttons ?? []).flatMap((row: Array<{ callback_data: string }>) =>
+    const kinds = buttons.flatMap((row: Array<{ callback_data: string }>) =>
       row.map((button) => {
         const token = button.callback_data.split(":").pop() ?? "";
         return (controller as any).store.getCallback(token)?.kind;
@@ -2070,16 +2078,9 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
-    expect(sendMessageTelegram).toHaveBeenCalledTimes(1);
-    expect(sendMessageTelegram).toHaveBeenCalledWith(
-      "123",
-      expect.stringContaining("Binding: Discord Thread"),
-      expect.objectContaining({
-        accountId: "default",
-        buttons: expect.any(Array),
-      }),
-    );
+    expect(reply.text).toContain("Binding: Discord Thread (openclaw)");
+    expect((reply.channelData as any)?.telegram?.buttons).toHaveLength(5);
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
   });
 
   it("preserves Telegram buttons when the outbound adapter lacks sendPayload", async () => {
@@ -2105,16 +2106,9 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
-    expect(sendMessageTelegram).toHaveBeenCalledTimes(1);
-    expect(sendMessageTelegram).toHaveBeenCalledWith(
-      "123",
-      expect.stringContaining("Binding: Discord Thread"),
-      expect.objectContaining({
-        accountId: "default",
-        buttons: expect.any(Array),
-      }),
-    );
+    expect(reply.text).toContain("Binding: Discord Thread (openclaw)");
+    expect((reply.channelData as any)?.telegram?.buttons).toHaveLength(5);
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
   });
 
   it("shows pending default controls when the bound thread is not materialized yet", async () => {
@@ -2144,13 +2138,9 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
-    expect(sendMessageTelegram).toHaveBeenCalledTimes(1);
-    const firstCall = sendMessageTelegram.mock.calls[0] as unknown as
-      | [string, string, { buttons?: Array<Array<{ text: string; callback_data: string }>> }]
-      | undefined;
-    const text = firstCall?.[1] ?? "";
-    const buttons = firstCall?.[2]?.buttons ?? [];
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    const text = reply.text ?? "";
+    const buttons = (reply.channelData as any)?.telegram?.buttons ?? [];
 
     expect(text).toContain("Model: unknown");
     expect(text).toContain("saved as defaults until then");
@@ -2187,11 +2177,8 @@ describe("Discord controller flows", () => {
         getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
       }),
     );
-    expect(reply).toEqual({});
-    const firstCall = sendMessageTelegram.mock.calls[0] as unknown as
-      | [string, string, { buttons?: Array<Array<{ text: string; callback_data: string }>> }]
-      | undefined;
-    const buttons = firstCall?.[2]?.buttons ?? [];
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    const buttons = (reply.channelData as any)?.telegram?.buttons ?? [];
 
     expect(buttons[1]).toHaveLength(1);
     expect(buttons[1][0].text).toBe("Permissions: toggle");
@@ -2234,9 +2221,8 @@ describe("Discord controller flows", () => {
         getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
       }),
     );
-    expect(reply).toEqual({});
-    const firstCall = sendMessageTelegram.mock.calls[0] as unknown as [string, string] | undefined;
-    const text = firstCall?.[1] ?? "";
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    const text = reply.text ?? "";
     expect(text).toContain("Binding: Discord Thread (openclaw)");
     expect(text).toContain("Model: openai/gpt-5.3-codex · reasoning high");
     expect(text).toContain("Fast mode: off");
@@ -2324,9 +2310,8 @@ describe("Discord controller flows", () => {
       threadId: "thread-1",
       serviceTier: "fast",
     });
-    expect(reply).toEqual({});
-    const firstCall = sendMessageTelegram.mock.calls[0] as unknown as [string, string] | undefined;
-    const text = firstCall?.[1] ?? "";
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    const text = reply.text ?? "";
     expect(text).toContain("Model: gpt-5.4");
     expect(text).toContain("Fast mode: on");
     expect(text).toContain("Permissions: Full Access");
@@ -2375,9 +2360,8 @@ describe("Discord controller flows", () => {
       threadId: "thread-1",
       serviceTier: "fast",
     });
-    expect(reply).toEqual({});
-    const firstCall = sendMessageTelegram.mock.calls[0] as unknown as [string, string] | undefined;
-    const text = firstCall?.[1] ?? "";
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    const text = reply.text ?? "";
     expect(text).toContain("Model: gpt-5.4");
     expect(text).toContain("Fast mode: on");
     expect(text).toContain("Permissions: Full Access");
@@ -3438,7 +3422,7 @@ describe("Discord controller flows", () => {
   });
 
   it("routes /cas_new through the new-thread full-access path", async () => {
-    const { controller, clientMock } = await createControllerHarness();
+    const { controller, clientMock, sendMessageTelegram } = await createControllerHarness();
     const requestConversationBinding = vi.fn(async () => ({ status: "bound" as const }));
 
     const reply = await controller.handleCommand(
@@ -3449,7 +3433,10 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
+    expect(reply.text).toContain("Binding: Discord Thread (openclaw)");
+    expect(reply.text).toContain("Project folder: /repo/openclaw");
+    expect((reply.channelData as any)?.telegram?.buttons).toHaveLength(5);
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
     expect(clientMock.startThread).toHaveBeenCalledWith({
       profile: "full-access",
       sessionKey: undefined,
@@ -3491,7 +3478,8 @@ describe("Discord controller flows", () => {
       }),
     );
 
-    expect(reply).toEqual({});
+    expect(reply.text).toContain("Binding: Discord Thread (openclaw)");
+    expect((reply.channelData as any)?.telegram?.buttons).toHaveLength(5);
     const binding = (controller as any).store.getBinding({
       channel: "telegram",
       accountId: "default",
@@ -6001,6 +5989,248 @@ describe("Discord controller flows", () => {
     ).toHaveLength(1);
   });
 
+  it("rebinds the interrupted startup thread before deciding whether to auto-resume", async () => {
+    const harness = createApiMock();
+    const store = new PluginStateStore(harness.stateDir);
+    await store.load();
+    await store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: TEST_TELEGRAM_PEER_ID,
+      },
+      sessionKey: buildConversationSessionKey({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: TEST_TELEGRAM_PEER_ID,
+      }),
+      threadId: "thread-live-progress",
+      workspaceDir: "/repo/old-path",
+      threadTitle: "Old title",
+      taskState: {
+        stage: "executing",
+        goal: "Resume safely after restart",
+        nextAction: "Wait for Codex to finish the interrupted task",
+        latestEvidence: "Already made visible live progress",
+        lastHeartbeatAt: Date.now() - 1_000,
+        updatedAt: Date.now() - 1_000,
+      },
+      updatedAt: Date.now() - 1_000,
+    });
+
+    const controller = new CodexPluginController(harness.api);
+    const clientMock = {
+      hasProfile: vi.fn((profile: string) => profile === "default" || profile === "full-access"),
+      logStartupProbe: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+      listModels: vi.fn(async () => [{ id: "openai/gpt-5.4", current: true }]),
+      readThreadState: vi.fn(async () => ({
+        threadId: "thread-live-progress",
+        threadName: "Recovered title",
+        model: "openai/gpt-5.4",
+        cwd: "/repo/new-path",
+        serviceTier: "default",
+        approvalPolicy: "on-request",
+        sandbox: "workspace-write",
+      })),
+      setThreadModel: vi.fn(async () => undefined),
+      setThreadServiceTier: vi.fn(async () => undefined),
+      setThreadPermissions: vi.fn(async () => undefined),
+      startTurn: vi.fn(() => ({
+        result: new Promise(() => {}),
+        getThreadId: () => "thread-live-progress",
+        queueMessage: vi.fn(async () => false),
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      })),
+      readAccount: vi.fn(async () => ({
+        email: "test@example.com",
+        planType: "pro",
+        type: "chatgpt",
+      })),
+      readRateLimits: vi.fn(async () => []),
+    };
+    (controller as any).client = clientMock;
+    (controller as any).readThreadHasChanges = vi.fn(async () => false);
+
+    await controller.start();
+
+    expect(clientMock.readThreadState).toHaveBeenCalledTimes(1);
+    expect(clientMock.startTurn).not.toHaveBeenCalled();
+    const reloadedStore = new PluginStateStore(harness.stateDir);
+    await reloadedStore.load();
+    const rebound = reloadedStore.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: TEST_TELEGRAM_PEER_ID,
+    });
+    expect(rebound?.threadTitle).toBe("Recovered title");
+    expect(rebound?.workspaceDir).toBe("/repo/new-path");
+    expect(rebound?.taskState).toEqual(
+      expect.objectContaining({
+        stage: "blocked",
+        blocker: "Automatic startup recovery paused because the interrupted run had already reported live progress",
+      }),
+    );
+  });
+
+  it("blocks startup recovery when the interrupted thread is missing", async () => {
+    const harness = createApiMock();
+    const store = new PluginStateStore(harness.stateDir);
+    await store.load();
+    await store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: TEST_TELEGRAM_PEER_ID,
+      },
+      sessionKey: buildConversationSessionKey({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: TEST_TELEGRAM_PEER_ID,
+      }),
+      threadId: "thread-missing",
+      workspaceDir: "/repo/openclaw",
+      taskState: {
+        stage: "executing",
+        goal: "Resume after restart",
+        nextAction: "Wait for Codex to continue",
+        lastHeartbeatAt: Date.now() - 1_000,
+        updatedAt: Date.now() - 1_000,
+      },
+      updatedAt: Date.now() - 1_000,
+    });
+
+    const controller = new CodexPluginController(harness.api);
+    const clientMock = {
+      hasProfile: vi.fn((profile: string) => profile === "default" || profile === "full-access"),
+      logStartupProbe: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+      listModels: vi.fn(async () => [{ id: "openai/gpt-5.4", current: true }]),
+      readThreadState: vi.fn(async () => {
+        throw new Error("Thread not found");
+      }),
+      readAccount: vi.fn(async () => ({
+        email: "test@example.com",
+        planType: "pro",
+        type: "chatgpt",
+      })),
+      readRateLimits: vi.fn(async () => []),
+      startTurn: vi.fn(),
+    };
+    (controller as any).client = clientMock;
+    (controller as any).readThreadHasChanges = vi.fn(async () => false);
+
+    await controller.start();
+
+    expect(clientMock.startTurn).not.toHaveBeenCalled();
+    const sentTexts = harness.sendMessageTelegram.mock.calls.flatMap((call) => {
+      const [, text] = call as unknown as [unknown, unknown];
+      return typeof text === "string" ? [text] : [];
+    });
+    expect(sentTexts).toContain(
+      "Gateway restarted while Codex was working, but the previously bound Codex thread is no longer available. Start a new thread or resume another thread.",
+    );
+    const reloadedStore = new PluginStateStore(harness.stateDir);
+    await reloadedStore.load();
+    const rebound = reloadedStore.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: TEST_TELEGRAM_PEER_ID,
+    });
+    expect(rebound?.taskState).toEqual(
+      expect.objectContaining({
+        stage: "blocked",
+        blocker: "Bound Codex thread is no longer available",
+        nextAction: "Start a new thread or resume another thread",
+      }),
+    );
+  });
+
+  it("ignores dirty shared workspace roots during startup recovery", async () => {
+    const harness = createApiMock();
+    const sharedWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-shared-workspace-"));
+    fs.writeFileSync(path.join(sharedWorkspace, "AGENTS.md"), "# test\n");
+    fs.writeFileSync(path.join(sharedWorkspace, "SOUL.md"), "# test\n");
+    fs.writeFileSync(path.join(sharedWorkspace, "MEMORY.md"), "# test\n");
+    const store = new PluginStateStore(harness.stateDir);
+    await store.load();
+    await store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: TEST_TELEGRAM_PEER_ID,
+      },
+      sessionKey: buildConversationSessionKey({
+        channel: "telegram",
+        accountId: "default",
+        conversationId: TEST_TELEGRAM_PEER_ID,
+      }),
+      threadId: "thread-shared-workspace",
+      workspaceDir: sharedWorkspace,
+      taskState: {
+        stage: "executing",
+        goal: "Resume safely after restart in the shared workspace",
+        nextAction: "Wait for Codex to continue the interrupted task",
+        lastHeartbeatAt: Date.now() - 1_000,
+        updatedAt: Date.now() - 1_000,
+      },
+      updatedAt: Date.now() - 1_000,
+    });
+
+    const controller = new CodexPluginController(harness.api);
+    const clientMock = {
+      hasProfile: vi.fn((profile: string) => profile === "default" || profile === "full-access"),
+      logStartupProbe: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+      listModels: vi.fn(async () => [{ id: "openai/gpt-5.4", current: true }]),
+      readThreadState: vi.fn(async () => ({
+        threadId: "thread-shared-workspace",
+        threadName: "Recovered Shared Workspace Thread",
+        model: "openai/gpt-5.4",
+        cwd: sharedWorkspace,
+        serviceTier: "default",
+        approvalPolicy: "on-request",
+        sandbox: "workspace-write",
+      })),
+      readThreadContext: vi.fn(async () => ({
+        lastUserMessage: "resume this",
+        lastAssistantMessage: undefined,
+      })),
+      readAccount: vi.fn(async () => ({
+        email: "test@example.com",
+        planType: "pro",
+        type: "chatgpt",
+      })),
+      readRateLimits: vi.fn(async () => []),
+      startTurn: vi.fn(() => ({
+        result: new Promise(() => {}),
+        getThreadId: () => "thread-shared-workspace",
+        queueMessage: vi.fn(async () => false),
+        interrupt: vi.fn(async () => {}),
+        isAwaitingInput: () => false,
+        submitPendingInput: vi.fn(async () => false),
+        submitPendingInputPayload: vi.fn(async () => false),
+      })),
+    };
+    (controller as any).client = clientMock;
+    (controller as any).readThreadHasChanges = vi.fn(async () => true);
+
+    await controller.start();
+
+    expect(clientMock.startTurn).toHaveBeenCalledTimes(1);
+    expect((controller as any).readThreadHasChanges).not.toHaveBeenCalled();
+    const sentTexts = harness.sendMessageTelegram.mock.calls.flatMap((call) => {
+      const [, text] = call as unknown as [unknown, unknown];
+      return typeof text === "string" ? [text] : [];
+    });
+    expect(sentTexts).toContain(
+      "Gateway restarted while Codex was working. Resuming the task from the saved checkpoint.",
+    );
+  });
+
   it("rebounds startup recovery onto a fresh thread when the bound thread context is exhausted", async () => {
     const harness = createApiMock();
     const store = new PluginStateStore(harness.stateDir);
@@ -6314,6 +6544,75 @@ describe("Discord controller flows", () => {
     expect(clientMock.compactThread).not.toHaveBeenCalled();
   });
 
+  it("does not start a second auto-compaction while one is already in progress", async () => {
+    const harness = createApiMock();
+    const store = new PluginStateStore(harness.stateDir);
+    const now = Date.now();
+    await store.load();
+    await store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "-1003701370893:topic:313",
+        parentConversationId: "-1003701370893",
+      },
+      sessionKey: "openclaw-codex-app-server:thread:thread-stuck-low-context",
+      threadId: "thread-stuck-low-context",
+      workspaceDir: "/repo/openclaw",
+      contextUsage: {
+        totalTokens: 194_000,
+        contextWindow: 258_400,
+        remainingPercent: 25,
+      },
+      autoCompactState: {
+        lastTriggeredAt: now - 2 * 60_000,
+        lastThreadId: "thread-stuck-low-context",
+        lastRemainingPercent: 25,
+        lastTotalTokens: 194_000,
+      },
+      updatedAt: now - 2 * 60_000,
+    });
+
+    const controller = new CodexPluginController(harness.api);
+    const clientMock = {
+      hasProfile: vi.fn((profile: string) => profile === "default" || profile === "full-access"),
+      logStartupProbe: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+      readThreadState: vi.fn(async () => ({
+        threadId: "thread-stuck-low-context",
+        threadName: "Stuck Low Context Thread",
+        model: "openai/gpt-5.4",
+        cwd: "/repo/openclaw",
+        serviceTier: "default",
+        approvalPolicy: "on-request",
+        sandbox: "workspace-write",
+      })),
+      compactThread: vi.fn(async () => ({
+        usage: {
+          totalTokens: 95_000,
+          contextWindow: 258_400,
+          remainingPercent: 63,
+        },
+      })),
+      readThreadContext: vi.fn(async () => ({
+        lastUserMessage: undefined,
+        lastAssistantMessage: undefined,
+      })),
+      readAccount: vi.fn(async () => ({
+        email: "test@example.com",
+        planType: "pro",
+        type: "chatgpt",
+      })),
+      readRateLimits: vi.fn(async () => []),
+    };
+    (controller as any).client = clientMock;
+    (controller as any).readThreadHasChanges = vi.fn(async () => false);
+
+    await controller.start();
+
+    expect(clientMock.compactThread).not.toHaveBeenCalled();
+  });
+
   it("clears failed auto-compaction attempts so the next reconcile can retry", async () => {
     const harness = createApiMock();
     const store = new PluginStateStore(harness.stateDir);
@@ -6507,7 +6806,7 @@ describe("Discord controller flows", () => {
     expect(sentTexts.some((text) => text.includes("Codex failed:"))).toBe(false);
   });
 
-  it("auto-recovers stale verifying bindings onto a fresh thread", async () => {
+  it("pauses stale verifying bindings instead of auto-running them again", async () => {
     const harness = createApiMock();
     const store = new PluginStateStore(harness.stateDir);
     await store.load();
@@ -6522,7 +6821,7 @@ describe("Discord controller flows", () => {
       threadId: "old-thread",
       workspaceDir: "/repo/openclaw",
       contextUsage: {
-        remainingPercent: 34,
+        remainingPercent: 36,
       },
       taskState: {
         stage: "verifying",
@@ -6629,24 +6928,8 @@ describe("Discord controller flows", () => {
 
     await controller.start();
 
-    expect(clientMock.startThread).toHaveBeenCalledTimes(1);
-    expect(clientMock.startTurn).toHaveBeenCalledWith(
-      expect.objectContaining({
-        existingThreadId: "fresh-thread",
-        workspaceDir: "/repo/openclaw",
-        prompt: expect.stringContaining("The previous Codex status thread became stale."),
-        input: [
-          expect.objectContaining({
-            type: "text",
-            text: expect.stringContaining("Use the fresh thread but keep the last Telegram context"),
-          }),
-          expect.objectContaining({
-            type: "text",
-            text: expect.stringContaining("The previous Codex status thread became stale."),
-          }),
-        ],
-      }),
-    );
+    expect(clientMock.startThread).not.toHaveBeenCalled();
+    expect(clientMock.startTurn).not.toHaveBeenCalled();
     const reloadedStore = new PluginStateStore(harness.stateDir);
     await reloadedStore.load();
     const rebound = reloadedStore.getBinding({
@@ -6655,11 +6938,13 @@ describe("Discord controller flows", () => {
       conversationId: "-1003701370893:topic:6685",
       parentConversationId: "-1003701370893",
     });
-    expect(rebound?.threadId).toBe("fresh-thread");
+    expect(rebound?.threadId).toBe("old-thread");
     expect(rebound?.taskState).toEqual(
       expect.objectContaining({
-        stage: "executing",
+        stage: "verifying",
         goal: "?",
+        nextAction: "Review the latest result, then send a new instruction or /cas_new",
+        resumeReason: "Review the latest Codex result",
       }),
     );
     const sentTexts = harness.sendMessageTelegram.mock.calls.flatMap((call) => {
@@ -6667,7 +6952,248 @@ describe("Discord controller flows", () => {
       return typeof text === "string" ? [text] : [];
     });
     expect(sentTexts).toContain(
-      "Detected a stale Codex status thread. Rebinding this topic to a fresh thread and continuing from the saved task card.",
+      "Detected a stale Codex status thread. I left the current Codex thread bound and paused automatic replay to avoid running the same task twice. Review the latest result, then send a new instruction when you want to continue, or /cas_new if you want a fresh thread.",
+    );
+  });
+
+  it("does not park stale verifying bindings for manual review on low context alone", async () => {
+    const harness = createApiMock();
+    const store = new PluginStateStore(harness.stateDir);
+    await store.load();
+    await store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "-1003701370893:topic:6684",
+        parentConversationId: "-1003701370893",
+      },
+      sessionKey: "openclaw-codex-app-server:thread:old-thread-review-only",
+      threadId: "old-thread-review-only",
+      workspaceDir: "/repo/openclaw",
+      contextUsage: {
+        totalTokens: 180_000,
+        contextWindow: 258_400,
+        remainingPercent: 40,
+      },
+      taskState: {
+        stage: "verifying",
+        goal: "?",
+        nextAction: "Review the latest Codex result",
+        latestEvidence: "Normal same-topic result with no foreign references.",
+        verification: {
+          status: "unverified",
+          updatedAt: Date.now() - 10 * 60_000,
+        },
+        lastHeartbeatAt: Date.now() - 10 * 60_000,
+        updatedAt: Date.now() - 10 * 60_000,
+      },
+      updatedAt: Date.now() - 10 * 60_000,
+    });
+
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-codex-home-"));
+    vi.stubEnv("HOME", fakeHome);
+    const now = new Date();
+    const sessionDir = path.join(
+      fakeHome,
+      ".openclaw",
+      "codex-home",
+      "sessions",
+      String(now.getFullYear()),
+      String(now.getMonth() + 1).padStart(2, "0"),
+      String(now.getDate()).padStart(2, "0"),
+    );
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionDir, "rollout-stale.jsonl"),
+      `${JSON.stringify({
+        timestamp: new Date(Date.now() - 2 * 60 * 60_000).toISOString(),
+        type: "session_meta",
+        payload: {
+          source: {
+            subagent: {
+              thread_spawn: {
+                parent_thread_id: "old-thread-review-only",
+              },
+            },
+          },
+        },
+      })}\n`,
+      "utf8",
+    );
+
+    const controller = new CodexPluginController(harness.api);
+    const clientMock = {
+      hasProfile: vi.fn((profile: string) => profile === "default" || profile === "full-access"),
+      logStartupProbe: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+      readThreadState: vi.fn(async () => ({
+        threadId: "old-thread-review-only",
+        threadName: "Review Only Thread",
+        model: "openai/gpt-5.4",
+        cwd: "/repo/openclaw",
+        serviceTier: "default",
+        approvalPolicy: "on-request",
+        sandbox: "workspace-write",
+      })),
+      compactThread: vi.fn(async () => ({
+        usage: {
+          totalTokens: 95_000,
+          contextWindow: 258_400,
+          remainingPercent: 63,
+        },
+      })),
+      readThreadContext: vi.fn(async () => ({
+        lastUserMessage: undefined,
+        lastAssistantMessage: undefined,
+      })),
+      readAccount: vi.fn(async () => ({
+        email: "test@example.com",
+        planType: "pro",
+        type: "chatgpt",
+      })),
+      readRateLimits: vi.fn(async () => []),
+      listModels: vi.fn(async () => [{ id: "openai/gpt-5.4", current: true }]),
+    };
+    (controller as any).client = clientMock;
+    (controller as any).readThreadHasChanges = vi.fn(async () => false);
+
+    await controller.start();
+
+    expect(clientMock.compactThread).not.toHaveBeenCalled();
+    const reloadedStore = new PluginStateStore(harness.stateDir);
+    await reloadedStore.load();
+    const rebound = reloadedStore.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "-1003701370893:topic:6684",
+      parentConversationId: "-1003701370893",
+    });
+    expect(rebound?.taskState).toEqual(
+      expect.objectContaining({
+        stage: "verifying",
+        nextAction: "Review the latest Codex result",
+      }),
+    );
+    const sentTexts = harness.sendMessageTelegram.mock.calls.flatMap((call) => {
+      const [, text] = call as unknown as [unknown, unknown];
+      return typeof text === "string" ? [text] : [];
+    });
+    expect(sentTexts).not.toContain(
+      "Detected a stale Codex status thread. I left the current Codex thread bound and paused automatic replay to avoid running the same task twice. Review the latest result, then send a new instruction when you want to continue, or /cas_new if you want a fresh thread.",
+    );
+  });
+
+  it("auto-compacts stale verifying bindings before marking them for manual review when context is low", async () => {
+    const harness = createApiMock();
+    const store = new PluginStateStore(harness.stateDir);
+    await store.load();
+    await store.upsertBinding({
+      conversation: {
+        channel: "telegram",
+        accountId: "default",
+        conversationId: "-1003701370893:topic:6686",
+        parentConversationId: "-1003701370893",
+      },
+      sessionKey: "openclaw-codex-app-server:thread:old-thread-low-context",
+      threadId: "old-thread-low-context",
+      workspaceDir: "/repo/openclaw",
+      contextUsage: {
+        totalTokens: 194_000,
+        contextWindow: 258_400,
+        remainingPercent: 25,
+      },
+      taskState: {
+        stage: "verifying",
+        goal: "?",
+        nextAction: "Review the latest Codex result",
+        latestEvidence: "This stale summary still talks about topic:4 instead of the current topic.",
+        verification: {
+          status: "unverified",
+          updatedAt: Date.now() - 10 * 60_000,
+        },
+        lastHeartbeatAt: Date.now() - 10 * 60_000,
+        updatedAt: Date.now() - 10 * 60_000,
+      },
+      updatedAt: Date.now() - 10 * 60_000,
+    });
+
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-codex-home-"));
+    vi.stubEnv("HOME", fakeHome);
+    const now = new Date();
+    const sessionDir = path.join(
+      fakeHome,
+      ".openclaw",
+      "codex-home",
+      "sessions",
+      String(now.getFullYear()),
+      String(now.getMonth() + 1).padStart(2, "0"),
+      String(now.getDate()).padStart(2, "0"),
+    );
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionDir, "rollout-stale.jsonl"),
+      `${JSON.stringify({
+        timestamp: new Date(Date.now() - 2 * 60 * 60_000).toISOString(),
+        type: "session_meta",
+        payload: {
+          source: {
+            subagent: {
+              thread_spawn: {
+                parent_thread_id: "old-thread-low-context",
+              },
+            },
+          },
+        },
+      })}\n`,
+      "utf8",
+    );
+
+    const controller = new CodexPluginController(harness.api);
+    const clientMock = {
+      hasProfile: vi.fn((profile: string) => profile === "default" || profile === "full-access"),
+      logStartupProbe: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+      readThreadState: vi.fn(async () => ({
+        threadId: "old-thread-low-context",
+        threadName: "Low Context Thread",
+        model: "openai/gpt-5.4",
+        cwd: "/repo/openclaw",
+        serviceTier: "default",
+        approvalPolicy: "on-request",
+        sandbox: "workspace-write",
+      })),
+      compactThread: vi.fn(async () => ({
+        usage: {
+          totalTokens: 95_000,
+          contextWindow: 258_400,
+          remainingPercent: 63,
+        },
+      })),
+      readThreadContext: vi.fn(async () => ({
+        lastUserMessage: undefined,
+        lastAssistantMessage: undefined,
+      })),
+      readAccount: vi.fn(async () => ({
+        email: "test@example.com",
+        planType: "pro",
+        type: "chatgpt",
+      })),
+      readRateLimits: vi.fn(async () => []),
+      listModels: vi.fn(async () => [{ id: "openai/gpt-5.4", current: true }]),
+    };
+    (controller as any).client = clientMock;
+    (controller as any).readThreadHasChanges = vi.fn(async () => false);
+
+    await controller.start();
+
+    expect(clientMock.compactThread).toHaveBeenCalledTimes(1);
+    const sentTexts = harness.sendMessageTelegram.mock.calls.flatMap((call) => {
+      const [, text] = call as unknown as [unknown, unknown];
+      return typeof text === "string" ? [text] : [];
+    });
+    expect(sentTexts.some((text) => text.includes("Compacting automatically before the thread fills."))).toBe(true);
+    expect(sentTexts).not.toContain(
+      "Detected a stale Codex status thread. I left the current Codex thread bound and paused automatic replay to avoid running the same task twice. Review the latest result, then send a new instruction when you want to continue, or /cas_new if you want a fresh thread.",
     );
   });
 
@@ -8712,21 +9238,14 @@ describe("Discord controller flows", () => {
       getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
     }));
 
-    expect(statusReply).toEqual({});
-    expect(sendMessageTelegram).toHaveBeenLastCalledWith(
-      "123",
-      expect.stringContaining("Task card:"),
-      expect.objectContaining({
-        accountId: "default",
-        buttons: expect.any(Array),
-      }),
-    );
-    const lastStatusText = sendMessageTelegram.mock.calls.at(-1)?.[1] as string;
-    expect(lastStatusText).toContain("Goal: Ship the prod-safe cockpit task card");
-    expect(lastStatusText).toContain("Stage: executing");
-    expect(lastStatusText).toContain("Next action: Run the prod smoke checks");
-    expect(lastStatusText).toContain("Latest evidence: Local vitest is green");
-    expect(lastStatusText).toContain("Blocker: Waiting for the Telegram reply path");
+    expect(statusReply.text).toContain("Task card:");
+    expect((statusReply.channelData as any)?.telegram?.buttons).toEqual(expect.any(Array));
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    expect(statusReply.text).toContain("Goal: Ship the prod-safe cockpit task card");
+    expect(statusReply.text).toContain("Stage: executing");
+    expect(statusReply.text).toContain("Next action: Run the prod smoke checks");
+    expect(statusReply.text).toContain("Latest evidence: Local vitest is green");
+    expect(statusReply.text).toContain("Blocker: Waiting for the Telegram reply path");
   });
 
   it("stores verification and checkpoint state through cas_verify and cas_checkpoint", async () => {
@@ -8764,12 +9283,12 @@ describe("Discord controller flows", () => {
       getCurrentConversationBinding: vi.fn(async () => ({ bindingId: "b1" })),
     }));
 
-    expect(statusReply).toEqual({});
-    const lastStatusText = sendMessageTelegram.mock.calls.at(-1)?.[1] as string;
-    expect(lastStatusText).toContain("Verification: Verified");
-    expect(lastStatusText).toContain("Verification summary: Local tests and host-side typecheck passed");
-    expect(lastStatusText).toContain("Checkpoint: Runtime artifact is ready");
-    expect(lastStatusText).toContain("Checkpoint next: Copy to ~/.openclaw/extensions and run /cas_status");
+    expect(statusReply.text).toContain("Verification: Verified");
+    expect((statusReply.channelData as any)?.telegram?.buttons).toEqual(expect.any(Array));
+    expect(sendMessageTelegram).not.toHaveBeenCalled();
+    expect(statusReply.text).toContain("Verification summary: Local tests and host-side typecheck passed");
+    expect(statusReply.text).toContain("Checkpoint: Runtime artifact is ready");
+    expect(statusReply.text).toContain("Checkpoint next: Copy to ~/.openclaw/extensions and run /cas_status");
   });
 
   it("refreshes a pinned Telegram status card in place after task-state updates", async () => {

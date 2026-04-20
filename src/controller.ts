@@ -1681,6 +1681,35 @@ function buildResumeTaskPrompt(taskState: TaskCardState | undefined): string {
   return lines.join("\n");
 }
 
+function buildInterruptedStartupRecoveryPrompt(taskState: TaskCardState | undefined): string {
+  const lines = [
+    "Resume the current Codex task from the existing long-lived thread context after a gateway restart.",
+  ];
+  if (taskState?.goal?.trim()) {
+    lines.push(`Goal: ${taskState.goal.trim()}`);
+  }
+  if (taskState?.checkpoint?.summary?.trim()) {
+    lines.push(`Checkpoint: ${taskState.checkpoint.summary.trim()}`);
+  }
+  if (taskState?.checkpoint?.nextAction?.trim()) {
+    lines.push(`Checkpoint next action: ${taskState.checkpoint.nextAction.trim()}`);
+  }
+  if (taskState?.latestEvidence?.trim()) {
+    lines.push(`Latest evidence: ${taskState.latestEvidence.trim()}`);
+  }
+  if (taskState?.blocker?.trim()) {
+    lines.push(`Recent blocker: ${taskState.blocker.trim()}`);
+  }
+  if (taskState?.nextAction?.trim()) {
+    lines.push(`Current next action: ${taskState.nextAction.trim()}`);
+  }
+  lines.push("Before doing anything new, reconstruct what is already complete from the saved task card and recent Telegram context.");
+  lines.push("Do not repeat tool calls, file edits, deploys, messages, or other side effects unless the current state clearly shows they are still needed.");
+  lines.push("If the recovery state is ambiguous or looks risky, stop and ask for confirmation instead of guessing.");
+  lines.push("Continue from the next unfinished logical step and report only fresh progress.");
+  return lines.join("\n");
+}
+
 function buildFreshThreadRecoveryPrompt(
   taskState: TaskCardState | undefined,
   foreignTopicRefs: string[] = [],
@@ -2379,6 +2408,163 @@ export class CodexPluginController {
     }
   }
 
+  private async restoreInterruptedStartupBinding(
+    binding: StoredBinding,
+    conversation: ConversationTarget,
+  ): Promise<StoredBinding | null> {
+    const profile = this.getPermissionsMode(binding);
+    let state: ThreadState | undefined;
+    try {
+      state = await this.client.readThreadState({
+        profile,
+        sessionKey: binding.sessionKey,
+        threadId: binding.threadId,
+      });
+    } catch (error) {
+      if (isMissingThreadError(error)) {
+        this.api.logger.warn?.(
+          `codex startup recovery missing interrupted thread ${this.formatConversationForLog(conversation)} thread=${binding.threadId}: ${String(error)}`,
+        );
+        await this.sendText(
+          conversation,
+          "Gateway restarted while Codex was working, but the previously bound Codex thread is no longer available. Start a new thread or resume another thread.",
+        );
+        await this.upsertTaskState(binding, {
+          stage: "blocked",
+          blocker: "Bound Codex thread is no longer available",
+          nextAction: "Start a new thread or resume another thread",
+          checkpoint: buildTaskCheckpoint(
+            "The bound Codex thread is missing",
+            "Start a new thread or resume another thread",
+          ),
+          lastHeartbeatAt: Date.now(),
+        });
+        return null;
+      }
+      throw error;
+    }
+    const reconciled =
+      (await this.reconcileThreadConfiguration(binding, {
+        threadState: state,
+        context: "restore interrupted startup binding",
+      })) ?? state;
+    const nextThreadTitle = reconciled?.threadName?.trim() || binding.threadTitle;
+    const nextWorkspaceDir = reconciled?.cwd?.trim() || binding.workspaceDir;
+    if (nextThreadTitle === binding.threadTitle && nextWorkspaceDir === binding.workspaceDir) {
+      return binding;
+    }
+    const rebound: StoredBinding = {
+      ...binding,
+      threadTitle: nextThreadTitle,
+      workspaceDir: nextWorkspaceDir,
+      updatedAt: Date.now(),
+    };
+    await this.store.upsertBinding(rebound);
+    await this.syncTelegramBindingSummary(conversation, {
+      threadId: rebound.threadId,
+      threadTitle: rebound.threadTitle,
+    }).catch(() => undefined);
+    return rebound;
+  }
+
+  private async assessInterruptedStartupRecovery(binding: StoredBinding): Promise<
+    | { mode: "resume" }
+    | { mode: "fresh-thread" }
+    | { mode: "pause"; reason: string; checkpointSummary: string }
+  > {
+    if (this.shouldRecoverInterruptedTurnOnFreshThread(binding)) {
+      return { mode: "fresh-thread" };
+    }
+    const liveProgress =
+      binding.taskState?.latestEvidence?.trim() ||
+      binding.taskState?.lastRunSummary?.trim();
+    if (liveProgress) {
+      return {
+        mode: "pause",
+        reason: "the interrupted run had already reported live progress",
+        checkpointSummary:
+          "Gateway restarted while a Codex task was marked executing and the interrupted run had already reported live progress, so automatic resume stayed paused to avoid duplicate execution.",
+      };
+    }
+    const shouldGuardLocalChanges = !this.isSharedWorkspaceDir(binding.workspaceDir);
+    const hasChanges = shouldGuardLocalChanges
+      ? await this.readThreadHasChanges(binding.workspaceDir)
+      : false;
+    if (hasChanges) {
+      return {
+        mode: "pause",
+        reason: "the workspace already has local changes",
+        checkpointSummary:
+          "Gateway restarted while a Codex task was marked executing and the workspace already had local changes, so automatic resume stayed paused to avoid duplicate execution.",
+      };
+    }
+    return { mode: "resume" };
+  }
+
+  private async recoverInterruptedTurnOnExistingThread(
+    binding: StoredBinding,
+    conversation: ConversationTarget,
+  ): Promise<void> {
+    this.api.logger.info?.(
+      `codex startup recovery resuming interrupted turn ${this.formatConversationForLog(conversation)} thread=${binding.threadId}`,
+    );
+    await this.sendText(
+      conversation,
+      "Gateway restarted while Codex was working. Resuming the task from the saved checkpoint.",
+    );
+    const rebound = await this.upsertTaskState(binding, {
+      stage: "executing",
+      nextAction: "Wait for Codex to continue from the recovered checkpoint",
+      blocker: null,
+      resumeReason: "Wait for Codex to continue from the recovered checkpoint",
+      lastHeartbeatAt: Date.now(),
+    });
+    const recoveryPrompt = buildInterruptedStartupRecoveryPrompt(rebound.taskState);
+    const recoveryInput = await this.buildRecoveryTurnInput({
+      conversation,
+      prompt: recoveryPrompt,
+    });
+    await this.startTurn({
+      conversation,
+      binding: rebound,
+      workspaceDir: rebound.workspaceDir,
+      prompt: recoveryPrompt,
+      input: recoveryInput,
+      reason: "command",
+      skipProgressKeepalive: true,
+    });
+    const active = this.activeRuns.get(buildConversationKey(conversation));
+    if (active) {
+      this.startRecoveryTurnKeepalive(conversation, rebound, active.handle);
+    }
+  }
+
+  private async pauseInterruptedTurnOnStartup(
+    binding: StoredBinding,
+    conversation: ConversationTarget,
+    reason: string,
+    checkpointSummary: string,
+  ): Promise<void> {
+    this.api.logger.info?.(
+      `codex startup recovery paused interrupted turn ${this.formatConversationForLog(conversation)} thread=${binding.threadId} reason=${reason}`,
+    );
+    await this.sendText(
+      conversation,
+      `Gateway restarted while Codex was working. Automatic resume stayed paused because ${reason}. Send a new instruction or /cas_resume when you want to continue.`,
+    );
+    await this.upsertTaskState(binding, {
+      stage: "blocked",
+      blocker: `Automatic startup recovery paused because ${reason}`,
+      nextAction: "Send a new instruction or /cas_resume to continue",
+      resumeReason: `Automatic startup recovery paused because ${reason}`,
+      checkpoint: buildTaskCheckpoint(
+        checkpointSummary,
+        "Send a new instruction or /cas_resume to continue",
+      ),
+      lastHeartbeatAt: Date.now(),
+    });
+  }
+
   private async recoverInterruptedTurnsOnStartup(): Promise<void> {
     const now = Date.now();
     const bindings = this.store.listBindings();
@@ -2393,35 +2579,25 @@ export class CodexPluginController {
       if (this.store.getPendingRequestByConversation(conversation)) {
         continue;
       }
-      this.api.logger.info?.(
-        `codex startup recovery resuming interrupted turn ${this.formatConversationForLog(conversation)} thread=${binding.threadId}`,
-      );
-      if (this.shouldRecoverInterruptedTurnOnFreshThread(binding)) {
-        await this.recoverInterruptedTurnOnFreshThread(binding, conversation);
+      const rebound = await this.restoreInterruptedStartupBinding(binding, conversation);
+      if (!rebound) {
         continue;
       }
-      const resumePrompt = buildResumeTaskPrompt(binding.taskState);
-      const recoveryInput = await this.buildRecoveryTurnInput({
-        conversation,
-        prompt: resumePrompt,
-      });
-      await this.sendText(
-        conversation,
-        "Gateway restarted while Codex was working. Resuming the task from the saved checkpoint.",
-      );
-      await this.startTurn({
-        conversation,
-        binding,
-        workspaceDir: binding.workspaceDir,
-        prompt: resumePrompt,
-        input: recoveryInput,
-        reason: "command",
-        skipProgressKeepalive: true,
-      });
-      const active = this.activeRuns.get(buildConversationKey(conversation));
-      if (active) {
-        this.startRecoveryTurnKeepalive(conversation, binding, active.handle);
+      const recovery = await this.assessInterruptedStartupRecovery(rebound);
+      if (recovery.mode === "fresh-thread") {
+        await this.recoverInterruptedTurnOnFreshThread(rebound, conversation);
+        continue;
       }
+      if (recovery.mode === "pause") {
+        await this.pauseInterruptedTurnOnStartup(
+          rebound,
+          conversation,
+          recovery.reason,
+          recovery.checkpointSummary,
+        );
+        continue;
+      }
+      await this.recoverInterruptedTurnOnExistingThread(rebound, conversation);
     }
   }
 
@@ -3201,12 +3377,23 @@ export class CodexPluginController {
         requestedYolo: parsed.requestedYolo,
       },
       requestConversationBinding,
+      !isTelegramChannel(channel),
     );
     if (result.status === "pending") {
       return result.reply;
     }
     if (result.status === "error") {
       return { text: result.message };
+    }
+    if (isTelegramChannel(channel)) {
+      const nextBinding = this.store.getBinding(conversation);
+      if (nextBinding) {
+        const card = await this.buildStatusCard(conversation, nextBinding, true);
+        if (card.buttons) {
+          return buildReplyWithButtons(card.text, card.buttons);
+        }
+        return { text: card.text };
+      }
     }
     return {};
   }
@@ -7057,6 +7244,7 @@ Latest context usage: ${usageText}`
           requestedYolo: callback.requestedYolo,
         },
         responders.requestConversationBinding,
+        true,
         callback.preserveTaskState ?? true,
       );
       if (result.status === "pending") {
@@ -8047,6 +8235,7 @@ Compaction started.`,
     syncTopic: boolean,
     overrides: CommandPreferenceOverrides,
     requestConversationBinding?: PickerResponders["requestConversationBinding"],
+    sendNotifications = true,
     preserveTaskState = false,
   ): Promise<
     | { status: "bound" }
@@ -8098,7 +8287,9 @@ Compaction started.`,
         await this.renameConversationIfSupported(conversation, syncedName);
       }
     }
-    await this.sendBoundConversationNotifications(conversation);
+    if (sendNotifications) {
+      await this.sendBoundConversationNotifications(conversation);
+    }
     return { status: "bound" };
   }
 
@@ -8653,6 +8844,28 @@ Compaction started.`,
     return Boolean(trimmed && /[/\\]worktrees[/\\][^/\\]+[/\\][^/\\]+/.test(trimmed));
   }
 
+  private isSharedWorkspaceDir(projectKey?: string): boolean {
+    const trimmed = projectKey?.trim();
+    if (!trimmed) {
+      return false;
+    }
+    const normalized = path.resolve(trimmed);
+    const candidates = [
+      this.settings.defaultWorkspaceDir,
+      this.serviceWorkspaceDir,
+      process.env.OPENCLAW_WORKSPACE_DIR,
+    ]
+      .map((value) => value?.trim())
+      .filter((value): value is string => Boolean(value))
+      .map((value) => path.resolve(value));
+    if (candidates.includes(normalized)) {
+      return true;
+    }
+    return existsSync(path.join(normalized, "AGENTS.md")) &&
+      existsSync(path.join(normalized, "SOUL.md")) &&
+      existsSync(path.join(normalized, "MEMORY.md"));
+  }
+
   private readThreadHasChanges(projectKey?: string): Promise<boolean | undefined> {
     const cwd = projectKey?.trim();
     if (!cwd) {
@@ -8832,14 +9045,15 @@ Compaction started.`,
     text: string,
     buttons: PluginInteractiveButtons,
   ): Promise<ReplyPayload> {
+    if (isTelegramChannel(conversation.channel)) {
+      return buildReplyWithButtons(text, buttons);
+    }
     try {
       await this.sendReplyWithDeliveryRef(conversation, {
         text,
         buttons,
       });
-      return isDiscordChannel(conversation.channel)
-        ? { text: "Sent Codex status controls to this Discord conversation." }
-        : {};
+      return { text: "Sent Codex status controls to this Discord conversation." };
     } catch (error) {
       this.api.logger.warn(`codex ${conversation.channel} status card send failed: ${String(error)}`);
       return { text };
@@ -9446,14 +9660,18 @@ Compaction started.`,
       return false;
     }
     const lastTriggeredAt = binding.autoCompactState?.lastTriggeredAt ?? 0;
+    const lastCompletedAt = binding.autoCompactState?.lastCompletedAt ?? 0;
+    const lastFailedAt = binding.autoCompactState?.lastFailedAt ?? 0;
+    const lastTerminalAt = Math.max(lastCompletedAt, lastFailedAt);
+    if (lastTriggeredAt && lastTriggeredAt > lastTerminalAt) {
+      return false;
+    }
     if (lastTriggeredAt && now - lastTriggeredAt < COMPACT_PROGRESS_INTERVAL_MS) {
       return false;
     }
-    const lastCompletedAt = binding.autoCompactState?.lastCompletedAt ?? 0;
     if (lastCompletedAt && now - lastCompletedAt < AUTO_COMPACT_COOLDOWN_MS) {
       return false;
     }
-    const lastFailedAt = binding.autoCompactState?.lastFailedAt ?? 0;
     if (lastFailedAt && now - lastFailedAt < AUTO_COMPACT_FAILURE_COOLDOWN_MS) {
       return false;
     }
@@ -9579,7 +9797,7 @@ Compaction started.`,
     return stats;
   }
 
-  private async recoverStaleVerifyingBinding(params: {
+  private async markStaleVerifyingBindingNeedsReview(params: {
     binding: StoredBinding;
     conversation: ConversationTarget;
     foreignTopicRefs: string[];
@@ -9589,49 +9807,23 @@ Compaction started.`,
     const { binding, conversation, foreignTopicRefs, rolloutCount, rolloutIdleMs } = params;
     const conversationKey = buildConversationKey(conversation);
     this.recentAutoRecoveries.set(conversationKey, Date.now());
-    const profile = this.getPermissionsMode(binding);
     this.api.logger.info?.(
-      `codex auto-recovering stale verifying binding ${this.formatConversationForLog(conversation)} thread=${binding.threadId} rolloutCount=${rolloutCount} rolloutIdleMs=${rolloutIdleMs} foreignTopics=${foreignTopicRefs.join(",") || "<none>"}`,
+      `codex stale verifying binding needs review ${this.formatConversationForLog(conversation)} thread=${binding.threadId} rolloutCount=${rolloutCount} rolloutIdleMs=${rolloutIdleMs} foreignTopics=${foreignTopicRefs.join(",") || "<none>"}`,
     );
     await this.sendText(
       conversation,
-      "Detected a stale Codex status thread. Rebinding this topic to a fresh thread and continuing from the saved task card.",
+      "Detected a stale Codex status thread. I left the current Codex thread bound and paused automatic replay to avoid running the same task twice. Review the latest result, then send a new instruction when you want to continue, or /cas_new if you want a fresh thread.",
     );
-    const created = await this.client.startThread({
-      profile,
-      sessionKey: binding.sessionKey,
-      workspaceDir: binding.workspaceDir,
-      model: binding.preferences?.preferredModel?.trim() || undefined,
-    });
-    let rebound = await this.bindConversation(conversation, {
-      sessionKey: binding.sessionKey,
-      threadId: created.threadId,
-      workspaceDir: created.cwd?.trim() || binding.workspaceDir,
-      threadTitle: created.threadName,
-      permissionsMode: profile,
-      preferences: binding.preferences,
-      preserveContextUsage: false,
-    });
-    rebound = await this.upsertTaskState(rebound, {
-      stage: "executing",
-      nextAction: "Wait for Codex to continue from the recovered task card",
+    await this.upsertTaskState(binding, {
+      stage: "verifying",
       blocker: null,
-      resumeReason: "Wait for Codex to continue from the recovered task card",
+      nextAction: "Review the latest result, then send a new instruction or /cas_new",
+      resumeReason: "Review the latest Codex result",
+      checkpoint: buildTaskCheckpoint(
+        "Stale verifying task was not auto-replayed because that can duplicate execution.",
+        "Review the latest result, then send a new instruction or /cas_new",
+      ),
       lastHeartbeatAt: Date.now(),
-    });
-    const recoveryPrompt = buildFreshThreadRecoveryPrompt(rebound.taskState, foreignTopicRefs);
-    const recoveryInput = await this.buildRecoveryTurnInput({
-      conversation,
-      prompt: recoveryPrompt,
-    });
-    await this.startTurn({
-      conversation,
-      binding: rebound,
-      workspaceDir: rebound.workspaceDir,
-      prompt: recoveryPrompt,
-      input: recoveryInput,
-      reason: "command",
-      skipProgressKeepalive: true,
     });
   }
 
@@ -9667,9 +9859,24 @@ Compaction started.`,
             );
             const lowContextRemaining = typeof binding.contextUsage?.remainingPercent === "number" &&
               binding.contextUsage.remainingPercent <= STALE_VERIFY_REMAINING_PERCENT_MAX;
+            if (lowContextRemaining) {
+              const compacted = await this.maybeAutoCompactBinding({
+                binding,
+                conversation,
+                now,
+              }).catch((error) => {
+                this.api.logger.warn(
+                  `codex stale verifying auto compact failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
+                );
+                return false;
+              });
+              if (compacted) {
+                continue;
+              }
+            }
             const heavyRolloutFanout = rolloutCount >= STALE_VERIFY_CHILD_ROLLOUT_COUNT_MIN;
-            if (lowContextRemaining || heavyRolloutFanout || foreignTopicRefs.length > 0) {
-              await this.recoverStaleVerifyingBinding({
+            if (heavyRolloutFanout || foreignTopicRefs.length > 0) {
+              await this.markStaleVerifyingBindingNeedsReview({
                 binding,
                 conversation,
                 foreignTopicRefs,
@@ -9677,7 +9884,7 @@ Compaction started.`,
                 rolloutIdleMs,
               }).catch((error) => {
                 this.api.logger.warn(
-                  `codex stale verifying auto-recovery failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
+                  `codex stale verifying review marker failed ${this.formatConversationForLog(conversation)}: ${String(error)}`,
                 );
               });
               continue;

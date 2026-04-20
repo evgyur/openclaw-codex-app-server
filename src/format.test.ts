@@ -189,18 +189,18 @@ describe("formatCodexStatusText", () => {
 
     expect(text).toContain("Binding: Fix Telegram approval flow (openclaw)");
     expect(text).toContain(`Plugin version: ${TEST_PLUGIN_VERSION}`);
-    expect(text).toContain("Model: openai/gpt-5.4 · reasoning high");
+    expect(text).toContain("🤖 Model: openai/gpt-5.4 · reasoning high");
     expect(text).toContain(`Project folder: ${shortenHomePathForTest(TEST_PROJECT_PATH)}`);
     expect(text).toContain(`Worktree folder: ${shortenHomePathForTest(TEST_WORKTREE_PATH)}`);
-    expect(text).toContain("Fast mode: off");
+    expect(text).toContain("⚡ Fast mode: off");
     expect(text).toContain("Plan mode: off");
-    expect(text).toContain("Context usage: unavailable until Codex emits a token-usage update");
+    expect(text).toContain("🧠 Context usage: unavailable until Codex emits a token-usage update");
     expect(text).toContain("Permissions: Default");
     expect(text).toContain(`Account: ${TEST_MASKED_EMAIL} (pro)`);
     expect(text).toContain("Thread: 019cc00d-6cf4-7c11-afcd-2673db349a21");
     expect(text).toContain("Rate limits timezone:");
     expect(text).toContain("5h limit: 85% left");
-    expect(text).toContain("Weekly limit: 85% left");
+    expect(text).toContain("📅 Weekly limit: 85% left");
   });
 
   afterEach(() => {
@@ -237,7 +237,7 @@ describe("formatCodexStatusText", () => {
       ],
     });
 
-    expect(text).toContain("Context usage: 139k / 258k tokens used (54% full)");
+    expect(text).toContain("🧠 Context usage: 139k / 258k tokens used (54% full)");
     expect(text).toContain(
       "Lean-context hint: add a checkpoint soon so you can cut to a fresh continuation without losing task state.",
     );
@@ -272,7 +272,7 @@ describe("formatCodexStatusText", () => {
       },
     });
 
-    expect(text).toContain("Context usage: 201k / 258k tokens used (78% full)");
+    expect(text).toContain("🧠 Context usage: 201k / 258k tokens used (78% full)");
     expect(text).toContain(
       "Lean-context hint: context is getting heavy. If this is a new phase, continue from the latest checkpoint instead of dragging the full transcript tail.",
     );
@@ -478,7 +478,7 @@ describe("formatCodexStatusText", () => {
     });
 
     expect(text).not.toContain("Context usage: ? / 272k");
-    expect(text).toContain("Context usage: unavailable until Codex emits a token-usage update");
+    expect(text).toContain("🧠 Context usage: unavailable until Codex emits a token-usage update");
   });
 
   it("hides non-matching model-specific rate-limit rows", () => {
@@ -507,7 +507,7 @@ describe("formatCodexStatusText", () => {
     });
 
     expect(text).toContain("5h limit: 96% left");
-    expect(text).toContain("Weekly limit: 83% left");
+    expect(text).toContain("📅 Weekly limit: 83% left");
     expect(text).not.toContain("GPT-5.3-Codex-Spark 5h limit");
     expect(text).not.toContain("GPT-5.3-Codex-Spark Weekly limit");
   });
@@ -538,9 +538,9 @@ describe("formatCodexStatusText", () => {
     });
 
     const genericFiveHourIndex = text.indexOf("5h limit: 96% left");
-    const genericWeeklyIndex = text.indexOf("Weekly limit: 83% left");
+    const genericWeeklyIndex = text.indexOf("📅 Weekly limit: 83% left");
     const sparkFiveHourIndex = text.indexOf("GPT-5.3-Codex-Spark 5h limit: 100% left");
-    const sparkWeeklyIndex = text.indexOf("GPT-5.3-Codex-Spark Weekly limit: 100% left");
+    const sparkWeeklyIndex = text.indexOf("GPT-5.3-Codex-Spark 📅 Weekly limit: 100% left");
 
     expect(genericFiveHourIndex).toBeGreaterThan(-1);
     expect(genericWeeklyIndex).toBeGreaterThan(genericFiveHourIndex);
@@ -595,8 +595,41 @@ describe("formatCodexStatusText", () => {
 
     expect(text).toContain(`Rate limits timezone: ${getCodexStatusTimeZoneLabel()}`);
     expect(text).toContain(`5h limit: 89% left (resets ${expectedFiveHourReset})`);
-    expect(text).toContain(`Weekly limit: 80% left (resets ${expectedWeeklyReset})`);
+    expect(text).toContain(`📅 Weekly limit: 80% left (resets ${expectedWeeklyReset})`);
+    expect(text).not.toContain("📉 Linear burn (5h limit):");
+    expect(text).toContain("📉 Linear burn: weekly limit survives to reset at the current pace");
     expect(text).not.toContain("Jan 21");
+  });
+
+  it("shows when a limit will run out before reset at the current burn rate", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-07T12:00:00Z"));
+
+    const text = formatCodexStatusText({
+      bindingActive: true,
+      threadState: {
+        threadId: "thread-123",
+        threadName: "Watch rate limits",
+        model: "gpt-5.4",
+        modelProvider: "openai",
+        cwd: "/repo/openclaw",
+      },
+      projectFolder: "/repo/openclaw",
+      worktreeFolder: "/repo/openclaw",
+      rateLimits: [
+        {
+          name: "Weekly limit",
+          usedPercent: 70,
+          resetAt: new Date("2026-03-10T00:00:00Z").getTime(),
+          windowSeconds: 604_800,
+        },
+      ],
+    });
+
+    expect(text).toContain("📅 Weekly limit: 30% left (resets Mar 10)");
+    expect(text).toMatch(
+      /📉 Linear burn: weekly limit runs out in 1d 22h, about 13h 43m before reset/,
+    );
   });
 });
 

@@ -481,13 +481,25 @@ export function getCodexStatusTimeZoneLabel(): string | undefined {
   return timeZone || undefined;
 }
 
+function getNormalizedCodexRateLimitResetAt(params: {
+  resetAt: number | undefined;
+  windowSeconds?: number;
+  nowMs?: number;
+}): number | undefined {
+  return advanceCodexResetAtToNextWindow({
+    resetAt: params.resetAt,
+    windowSeconds: params.windowSeconds,
+    nowMs: params.nowMs ?? Date.now(),
+  });
+}
+
 function formatCodexRateLimitReset(params: {
   resetAt: number | undefined;
   windowSeconds?: number;
   nowMs?: number;
 }): string | undefined {
   const nowMs = params.nowMs ?? Date.now();
-  const normalizedResetAt = advanceCodexResetAtToNextWindow({
+  const normalizedResetAt = getNormalizedCodexRateLimitResetAt({
     resetAt: params.resetAt,
     windowSeconds: params.windowSeconds,
     nowMs,
@@ -513,11 +525,103 @@ function formatCodexRateLimitReset(params: {
   }).format(date);
 }
 
+function formatCodexRateLimitLabel(name: string): string {
+  const { prefix, label } = splitCodexRateLimitName(name);
+  const normalized = label.trim().toLowerCase();
+  let decoratedLabel = label;
+  if (normalized === "weekly limit") {
+    decoratedLabel = "📅 Weekly limit";
+  } else if (normalized === "linear burn") {
+    decoratedLabel = "📉 Linear burn";
+  }
+  return prefix ? `${prefix} ${decoratedLabel}` : decoratedLabel;
+}
+
+function formatDurationShort(valueMs: number): string {
+  const totalMinutes = Math.max(0, Math.round(valueMs / 60_000));
+  if (totalMinutes < 1) {
+    return "<1m";
+  }
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+  const minutes = totalMinutes % 60;
+  const parts: string[] = [];
+  if (days > 0) {
+    parts.push(`${days}d`);
+  }
+  if (hours > 0) {
+    parts.push(`${hours}h`);
+  }
+  if (minutes > 0 && parts.length < 2) {
+    parts.push(`${minutes}m`);
+  }
+  return parts.slice(0, 2).join(" ") || "<1m";
+}
+
+function formatCodexLinearBurnLabel(name: string): string {
+  const { prefix } = splitCodexRateLimitName(name);
+  return prefix ? `${prefix} 📉 Linear burn` : "📉 Linear burn";
+}
+
+function formatCodexLinearBurnLine(
+  limit: RateLimitSummary,
+  nowMs = Date.now(),
+): string | undefined {
+  const { label } = splitCodexRateLimitName(limit.name);
+  if (label.trim().toLowerCase() !== "weekly limit") {
+    return undefined;
+  }
+  if (typeof limit.usedPercent !== "number" || limit.usedPercent <= 0 || limit.usedPercent >= 100) {
+    return undefined;
+  }
+  if (!limit.windowSeconds || !Number.isFinite(limit.windowSeconds) || limit.windowSeconds <= 0) {
+    return undefined;
+  }
+  const normalizedResetAt = getNormalizedCodexRateLimitResetAt({
+    resetAt: limit.resetAt,
+    windowSeconds: limit.windowSeconds,
+    nowMs,
+  });
+  if (!normalizedResetAt || normalizedResetAt <= nowMs) {
+    return undefined;
+  }
+  const windowMs = Math.round(limit.windowSeconds * 1_000);
+  if (windowMs <= 0) {
+    return undefined;
+  }
+  const windowStartAt = normalizedResetAt - windowMs;
+  const elapsedMs = nowMs - windowStartAt;
+  if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) {
+    return undefined;
+  }
+  const usedPercent = Math.max(0, Math.min(100, limit.usedPercent));
+  const burnRatePercentPerMs = usedPercent / elapsedMs;
+  if (!Number.isFinite(burnRatePercentPerMs) || burnRatePercentPerMs <= 0) {
+    return undefined;
+  }
+  const remainingPercent = 100 - usedPercent;
+  const timeToResetMs = normalizedResetAt - nowMs;
+  const sourceLabel = label.trim().toLowerCase();
+  const burnLabel = formatCodexLinearBurnLabel(limit.name);
+  if (remainingPercent <= 0) {
+    return `${burnLabel}: ${sourceLabel} is depleted now`;
+  }
+  const timeToExhaustMs = remainingPercent / burnRatePercentPerMs;
+  if (!Number.isFinite(timeToExhaustMs) || timeToExhaustMs <= 0) {
+    return `${burnLabel}: ${sourceLabel} is depleted now`;
+  }
+  if (timeToExhaustMs >= timeToResetMs) {
+    return `${burnLabel}: ${sourceLabel} survives to reset at the current pace`;
+  }
+  const beforeResetMs = timeToResetMs - timeToExhaustMs;
+  return `${burnLabel}: ${sourceLabel} runs out in ${formatDurationShort(timeToExhaustMs)}, about ${formatDurationShort(beforeResetMs)} before reset`;
+}
+
 export function formatCodexRateLimitLine(
   limit: RateLimitSummary,
   nowMs = Date.now(),
 ): string {
-  const prefix = `${limit.name}: `;
+  const prefix = `${formatCodexRateLimitLabel(limit.name)}: `;
   const resetText = formatCodexRateLimitReset({
     resetAt: limit.resetAt,
     windowSeconds: limit.windowSeconds,
@@ -547,6 +651,10 @@ function splitCodexRateLimitName(name: string): {
   if (lower.endsWith("weekly limit")) {
     const prefix = trimmed.slice(0, Math.max(0, trimmed.length - "weekly limit".length)).trim();
     return { prefix, label: "Weekly limit", labelOrder: 1 };
+  }
+  if (lower.endsWith("linear burn")) {
+    const prefix = trimmed.slice(0, Math.max(0, trimmed.length - "linear burn".length)).trim();
+    return { prefix, label: "Linear burn", labelOrder: 2 };
   }
   return { prefix: "", label: trimmed, labelOrder: 99 };
 }
@@ -687,21 +795,21 @@ export function formatCodexStatusText(params: {
     lines.push(`Plugin version: ${params.pluginVersion.trim()}`);
   }
   if (params.threadState) {
-    lines.push(`Model: ${formatCodexModelText(params.threadState)}`);
+    lines.push(`🤖 Model: ${formatCodexModelText(params.threadState)}`);
   }
   lines.push(`Project folder: ${shortenHomePath(params.projectFolder) ?? "unknown"}`);
   lines.push(`Worktree folder: ${shortenHomePath(params.worktreeFolder) ?? "unknown"}`);
   if (params.threadState || params.bindingActive) {
-    lines.push(`Fast mode: ${formatCodexFastModeValue(params.threadState?.serviceTier)}`);
+    lines.push(`⚡ Fast mode: ${formatCodexFastModeValue(params.threadState?.serviceTier)}`);
   }
   if (params.bindingActive && params.planMode !== undefined) {
     lines.push(`Plan mode: ${params.planMode ? "on" : "off"}`);
   }
   const contextUsageText = formatCodexContextUsageSnapshot(params.contextUsage);
   if (contextUsageText) {
-    lines.push(`Context usage: ${contextUsageText}`);
+    lines.push(`🧠 Context usage: ${contextUsageText}`);
   } else if (params.bindingActive) {
-    lines.push("Context usage: unavailable until Codex emits a token-usage update");
+    lines.push("🧠 Context usage: unavailable until Codex emits a token-usage update");
   }
   const permissions = formatCodexPermissions({
     approvalPolicy: params.threadState?.approvalPolicy,
@@ -742,6 +850,10 @@ export function formatCodexStatusText(params: {
     }
     for (const limit of visibleRateLimits) {
       lines.push(formatCodexRateLimitLine(limit));
+      const linearBurnLine = formatCodexLinearBurnLine(limit);
+      if (linearBurnLine) {
+        lines.push(linearBurnLine);
+      }
     }
   }
   return lines.join("\n");
