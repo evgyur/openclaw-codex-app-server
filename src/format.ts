@@ -775,6 +775,8 @@ export function formatCodexStatusText(params: {
   taskState?: TaskCardState;
 }): string {
   const lines = [];
+  const detailLines: string[] = [];
+  const emojiLines: string[] = [];
   const effectiveTaskState = buildEffectiveTaskCardState({
     taskState: params.taskState,
     bindingActive: params.bindingActive,
@@ -786,48 +788,52 @@ export function formatCodexStatusText(params: {
     params.threadState?.threadName?.trim() ||
     params.bindingThreadTitle?.trim();
   const bindingProjectName = getProjectName(params.projectFolder ?? params.worktreeFolder);
-  lines.push(
+  detailLines.push(
     params.bindingActive
       ? `Binding: ${bindingThreadName ?? "active"}${bindingProjectName ? ` (${bindingProjectName})` : ""}`
       : "Binding: none",
   );
   if (params.pluginVersion?.trim()) {
-    lines.push(`Plugin version: ${params.pluginVersion.trim()}`);
+    detailLines.push(`Plugin version: ${params.pluginVersion.trim()}`);
   }
-  if (params.threadState) {
-    lines.push(`🤖 Model: ${formatCodexModelText(params.threadState)}`);
-  }
-  lines.push(`Project folder: ${shortenHomePath(params.projectFolder) ?? "unknown"}`);
-  lines.push(`Worktree folder: ${shortenHomePath(params.worktreeFolder) ?? "unknown"}`);
-  if (params.threadState || params.bindingActive) {
-    lines.push(`⚡ Fast mode: ${formatCodexFastModeValue(params.threadState?.serviceTier)}`);
-  }
+  detailLines.push(`Project folder: ${shortenHomePath(params.projectFolder) ?? "unknown"}`);
+  detailLines.push(`Worktree folder: ${shortenHomePath(params.worktreeFolder) ?? "unknown"}`);
   if (params.bindingActive && params.planMode !== undefined) {
-    lines.push(`Plan mode: ${params.planMode ? "on" : "off"}`);
-  }
-  const contextUsageText = formatCodexContextUsageSnapshot(params.contextUsage);
-  if (contextUsageText) {
-    lines.push(`🧠 Context usage: ${contextUsageText}`);
-  } else if (params.bindingActive) {
-    lines.push("🧠 Context usage: unavailable until Codex emits a token-usage update");
+    detailLines.push(`Plan mode: ${params.planMode ? "on" : "off"}`);
   }
   const permissions = formatCodexPermissions({
     approvalPolicy: params.threadState?.approvalPolicy,
     sandbox: params.threadState?.sandbox,
   });
   if (permissions) {
-    lines.push(`Permissions: ${permissions}`);
+    detailLines.push(`Permissions: ${permissions}`);
   }
   if (params.threadNote?.trim()) {
-    lines.push(params.threadNote.trim());
+    detailLines.push(params.threadNote.trim());
   }
   if (params.permissionNote?.trim()) {
-    lines.push(params.permissionNote.trim());
+    detailLines.push(params.permissionNote.trim());
   }
-  lines.push(`Account: ${formatCodexAccountText(params.account)}`);
+  detailLines.push(`Account: ${formatCodexAccountText(params.account)}`);
   const threadId = params.threadState?.threadId?.trim();
   if (threadId) {
-    lines.push(`Thread: ${threadId}`);
+    detailLines.push(`Thread: ${threadId}`);
+  }
+  if (params.threadState) {
+    emojiLines.push(`🤖 Model: ${formatCodexModelText(params.threadState)}`);
+  }
+  if (params.threadState || params.bindingActive) {
+    emojiLines.push(`⚡ Fast mode: ${formatCodexFastModeValue(params.threadState?.serviceTier)}`);
+  }
+  const contextUsageText = formatCodexContextUsageSnapshot(params.contextUsage);
+  if (contextUsageText) {
+    emojiLines.push(`🧠 Context usage: ${contextUsageText}`);
+  } else if (params.bindingActive) {
+    emojiLines.push("🧠 Context usage: unavailable until Codex emits a token-usage update");
+  }
+  lines.push(...detailLines);
+  if (emojiLines.length > 0) {
+    lines.push("", ...emojiLines);
   }
   appendTaskCardLines(lines, effectiveTaskState);
   const leanContextHint = getLeanContextHint({

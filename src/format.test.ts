@@ -201,6 +201,9 @@ describe("formatCodexStatusText", () => {
     expect(text).toContain("Rate limits timezone:");
     expect(text).toContain("5h limit: 85% left");
     expect(text).toContain("📅 Weekly limit: 85% left");
+    expect(text).toMatch(
+      /Thread: 019cc00d-6cf4-7c11-afcd-2673db349a21\n\n🤖 Model: openai\/gpt-5\.4 · reasoning high\n⚡ Fast mode: off\n🧠 Context usage: unavailable until Codex emits a token-usage update/,
+    );
   });
 
   afterEach(() => {
