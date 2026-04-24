@@ -1310,9 +1310,13 @@ function parseRenameArgs(args: string): { syncTopic: boolean; name: string } | n
 
 type CommandPreferenceOverrides = {
   requestedModel?: string;
+  requestedReasoningEffort?: string;
   requestedFast?: boolean;
   requestedYolo?: boolean;
 };
+
+const CAS_NEW_DEFAULT_MODEL = "openai-codex/gpt-5.5";
+const CAS_NEW_DEFAULT_REASONING_EFFORT = "high";
 
 function parseStatusArgs(args: string): CommandPreferenceOverrides & { error?: string } {
   const tokens = normalizeOptionDashes(args)
@@ -3254,11 +3258,14 @@ export class CodexPluginController {
         return await this.handleJoinCommand(
           conversation,
           binding,
-          ["--new", "--yolo", args].filter(Boolean).join(" "),
+          ["--new", "--yolo", "--model", CAS_NEW_DEFAULT_MODEL, "--fast", args]
+            .filter(Boolean)
+            .join(" "),
           ctx.channel,
           ctx,
           pendingBind,
           hydratedBinding?.pendingBind,
+          CAS_NEW_DEFAULT_REASONING_EFFORT,
         );
       case "cas_detach":
         if (!conversation) {
@@ -3331,6 +3338,7 @@ export class CodexPluginController {
     parsed: ReturnType<typeof parseThreadSelectionArgs>,
     channel: string,
     requestConversationBinding?: PickerResponders["requestConversationBinding"],
+    defaultReasoningEffort?: string,
   ): Promise<ReplyPayload> {
     if (!conversation) {
       return { text: "This command needs a Telegram or Discord conversation." };
@@ -3373,6 +3381,7 @@ export class CodexPluginController {
       parsed.syncTopic,
       {
         requestedModel: parsed.requestedModel,
+        requestedReasoningEffort: defaultReasoningEffort,
         requestedFast: parsed.requestedFast,
         requestedYolo: parsed.requestedYolo,
       },
@@ -3431,6 +3440,7 @@ export class CodexPluginController {
     ctx: PluginCommandContext,
     pendingBind?: StoredPendingBind | null,
     hydratedPendingBind?: StoredPendingBind,
+    defaultReasoningEffort?: string,
   ): Promise<ReplyPayload> {
     const bindingApi = asScopedBindingApi(ctx);
     if (!conversation) {
@@ -3450,6 +3460,7 @@ export class CodexPluginController {
     }
     const overrides: CommandPreferenceOverrides = {
       requestedModel: parsed.requestedModel,
+      requestedReasoningEffort: defaultReasoningEffort,
       requestedFast: parsed.requestedFast,
       requestedYolo: parsed.requestedYolo,
     };
@@ -3460,6 +3471,7 @@ export class CodexPluginController {
         parsed,
         channel,
         bindingApi.requestConversationBinding,
+        defaultReasoningEffort,
       );
     }
     if (
@@ -4111,6 +4123,9 @@ export class CodexPluginController {
     const updates: Partial<ConversationPreferences> = {};
     if (overrides.requestedModel?.trim()) {
       updates.preferredModel = overrides.requestedModel.trim();
+    }
+    if (overrides.requestedReasoningEffort?.trim()) {
+      updates.preferredReasoningEffort = overrides.requestedReasoningEffort.trim();
     }
     if (typeof overrides.requestedFast === "boolean") {
       updates.preferredServiceTier = overrides.requestedFast ? "fast" : "default";

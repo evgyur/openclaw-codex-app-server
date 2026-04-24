@@ -42,7 +42,7 @@ export const COMMAND_HELP: Record<CommandName, CommandHelpEntry> = {
     summary: COMMAND_SUMMARY.cas_new,
     usage: "/cas_new [same overrides as /cas_resume]",
     examples: ["/cas_new", "/cas_new --model openai/gpt-5.4"],
-    notes: "Fast alias for `/cas_resume --new --yolo`. Use `/cas_new` when you want a fresh Codex thread immediately in the resolved workspace with Full Access.",
+    notes: "Fast alias for `/cas_resume --new --yolo --model openai-codex/gpt-5.5 --fast`, and it also saves reasoning=high for the new binding. Use `/cas_new` when you want a fresh Codex thread immediately in the resolved workspace with Full Access.",
   },
   cas_detach: {
     summary: COMMAND_SUMMARY.cas_detach,

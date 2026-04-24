@@ -3441,13 +3441,21 @@ describe("Discord controller flows", () => {
       profile: "full-access",
       sessionKey: undefined,
       workspaceDir: "/repo/openclaw",
-      model: undefined,
+      model: "openai-codex/gpt-5.5",
     });
     expect(requestConversationBinding).toHaveBeenCalledWith(
       expect.objectContaining({
         summary: expect.stringContaining("Bind this conversation to Codex thread"),
       }),
     );
+    const binding = (controller as any).store.getBinding({
+      channel: "telegram",
+      accountId: "default",
+      conversationId: "123",
+    });
+    expect(binding?.preferences?.preferredModel).toBe("openai-codex/gpt-5.5");
+    expect(binding?.preferences?.preferredReasoningEffort).toBe("high");
+    expect(binding?.preferences?.preferredServiceTier).toBe("fast");
   });
 
   it("clears inherited task state when /cas_new starts a fresh thread", async () => {
