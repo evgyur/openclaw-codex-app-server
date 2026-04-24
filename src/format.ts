@@ -775,8 +775,9 @@ export function formatCodexStatusText(params: {
   taskState?: TaskCardState;
 }): string {
   const lines = [];
-  const detailLines: string[] = [];
+  const headerLines: string[] = [];
   const emojiLines: string[] = [];
+  const secondaryLines: string[] = [];
   const effectiveTaskState = buildEffectiveTaskCardState({
     taskState: params.taskState,
     bindingActive: params.bindingActive,
@@ -788,36 +789,22 @@ export function formatCodexStatusText(params: {
     params.threadState?.threadName?.trim() ||
     params.bindingThreadTitle?.trim();
   const bindingProjectName = getProjectName(params.projectFolder ?? params.worktreeFolder);
-  detailLines.push(
+  headerLines.push(
     params.bindingActive
       ? `Binding: ${bindingThreadName ?? "active"}${bindingProjectName ? ` (${bindingProjectName})` : ""}`
       : "Binding: none",
   );
-  if (params.pluginVersion?.trim()) {
-    detailLines.push(`Plugin version: ${params.pluginVersion.trim()}`);
-  }
-  detailLines.push(`Project folder: ${shortenHomePath(params.projectFolder) ?? "unknown"}`);
-  detailLines.push(`Worktree folder: ${shortenHomePath(params.worktreeFolder) ?? "unknown"}`);
-  if (params.bindingActive && params.planMode !== undefined) {
-    detailLines.push(`Plan mode: ${params.planMode ? "on" : "off"}`);
+  headerLines.push(`Account: ${formatCodexAccountText(params.account)}`);
+  const threadId = params.threadState?.threadId?.trim();
+  if (threadId) {
+    headerLines.push(`Thread: ${threadId}`);
   }
   const permissions = formatCodexPermissions({
     approvalPolicy: params.threadState?.approvalPolicy,
     sandbox: params.threadState?.sandbox,
   });
   if (permissions) {
-    detailLines.push(`Permissions: ${permissions}`);
-  }
-  if (params.threadNote?.trim()) {
-    detailLines.push(params.threadNote.trim());
-  }
-  if (params.permissionNote?.trim()) {
-    detailLines.push(params.permissionNote.trim());
-  }
-  detailLines.push(`Account: ${formatCodexAccountText(params.account)}`);
-  const threadId = params.threadState?.threadId?.trim();
-  if (threadId) {
-    detailLines.push(`Thread: ${threadId}`);
+    headerLines.push(`Permissions: ${permissions}`);
   }
   if (params.threadState) {
     emojiLines.push(`🤖 Model: ${formatCodexModelText(params.threadState)}`);
@@ -831,11 +818,25 @@ export function formatCodexStatusText(params: {
   } else if (params.bindingActive) {
     emojiLines.push("🧠 Context usage: unavailable until Codex emits a token-usage update");
   }
-  lines.push(...detailLines);
+  if (params.threadNote?.trim()) {
+    secondaryLines.push(params.threadNote.trim());
+  }
+  if (params.permissionNote?.trim()) {
+    secondaryLines.push(params.permissionNote.trim());
+  }
+  if (params.bindingActive && params.planMode !== undefined) {
+    secondaryLines.push(`Plan mode: ${params.planMode ? "on" : "off"}`);
+  }
+  secondaryLines.push(`Project folder: ${shortenHomePath(params.projectFolder) ?? "unknown"}`);
+  secondaryLines.push(`Worktree folder: ${shortenHomePath(params.worktreeFolder) ?? "unknown"}`);
+  if (params.pluginVersion?.trim()) {
+    secondaryLines.push(`Plugin version: ${params.pluginVersion.trim()}`);
+  }
+  lines.push(...headerLines);
+  appendTaskCardLines(lines, effectiveTaskState);
   if (emojiLines.length > 0) {
     lines.push("", ...emojiLines);
   }
-  appendTaskCardLines(lines, effectiveTaskState);
   const leanContextHint = getLeanContextHint({
     bindingActive: params.bindingActive,
     contextUsage: params.contextUsage,
@@ -850,17 +851,19 @@ export function formatCodexStatusText(params: {
   });
   if (visibleRateLimits.length > 0) {
     const timeZoneLabel = getCodexStatusTimeZoneLabel();
-    lines.push("");
     if (timeZoneLabel) {
-      lines.push(`Rate limits timezone: ${timeZoneLabel}`);
+      secondaryLines.push(`Rate limits timezone: ${timeZoneLabel}`);
     }
     for (const limit of visibleRateLimits) {
-      lines.push(formatCodexRateLimitLine(limit));
+      secondaryLines.push(formatCodexRateLimitLine(limit));
       const linearBurnLine = formatCodexLinearBurnLine(limit);
       if (linearBurnLine) {
-        lines.push(linearBurnLine);
+        secondaryLines.push(linearBurnLine);
       }
     }
+  }
+  if (secondaryLines.length > 0) {
+    lines.push("", ...secondaryLines);
   }
   return lines.join("\n");
 }
